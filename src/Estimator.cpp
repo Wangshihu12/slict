@@ -1212,210 +1212,237 @@ public:
         packet_buf.push_back(msg);
     }
 
+    /**
+     * SLAM系统的主数据处理函数
+     * 功能描述：处理传感器数据，执行SLAM核心算法流程
+     * 主要步骤：
+     *   1. 数据检查和提取
+     *   2. 传感器初始化
+     *   3. IMU传播和点云去畸变
+     *   4. 点云-地图关联
+     *   5. LIO优化
+     *   6. 关键帧管理和闭环检测
+     *   7. 结果可视化和窗口滑动
+     * @return bool 处理是否成功（实际上是无限循环直到程序退出）
+     */
     bool ProcessData()
     {
         while (ros::ok())
         {
+            // 时间日志记录器和主循环计时器
             slict::TimeLog tlog; TicToc tt_whileloop;
 
-            // Check for time out to exit the program
+            // 检查数据超时以退出程序
             static TicToc tt_time_out;
 
             static double data_time_out = -1;
+            // 检查数据超时情况：如果20秒内没有新数据且缓冲区为空，则退出程序
             if ( (data_time_out != -1) && (tt_time_out.Toc()/1000.0 - data_time_out) > 20 && (packet_buf.size() == 0) && autoexit)
             {
                 printf(KYEL "Data timeout, Buf: %d. exit!\n" RESET, packet_buf.size());
-                SaveTrajLog();
-                exit(0);
+                SaveTrajLog();  // 保存轨迹日志
+                exit(0);        // 退出程序
             }
 
-            /* #region STEP 0: Loop if there is no new data ---------------------------------------------------------*/
+            /* #region STEP 0: 检查是否有新数据，无数据时循环等待 ---------------------------------------------------------*/
             
             TicToc tt_loop;
 
+            // 如果数据包缓冲区为空，则等待1毫秒后继续循环
             if (packet_buf.empty())
             {
                 this_thread::sleep_for(chrono::milliseconds(1));
                 continue;
             }
 
-            /* #endregion STEP 0: Loop if there is no new data ------------------------------------------------------*/
+            /* #endregion STEP 0: 检查是否有新数据，无数据时循环等待 ------------------------------------------------------*/
 
-            /* #region STEP 1: Extract the data packet --------------------------------------------------------------*/
+            /* #region STEP 1: 提取数据包 --------------------------------------------------------------*/
             
-            tt_preopt.Tic();
+            tt_preopt.Tic();  // 开始计时预处理优化时间
 
-            TicToc tt_extract;
+            TicToc tt_extract; // 提取数据包计时器
 
             slict::FeatureCloud::ConstPtr packet;
             {
+                // 使用互斥锁保护数据包缓冲区，确保线程安全
                 lock_guard<mutex> lock(packet_buf_mtx);
-                packet = packet_buf.front();
-                packet_buf.pop_front();
+                packet = packet_buf.front();  // 获取队首数据包
+                packet_buf.pop_front();       // 从队列中移除已处理的数据包
             }
 
-            // Reset the time out clock
+            // 重置超时计时器，记录最后一次接收数据的时间
             data_time_out = tt_time_out.Toc()/1000.0;
 
-            tt_extract.Toc();
+            tt_extract.Toc(); // 停止提取数据包的计时
 
-            /* #endregion STEP 1: Extract the data packet -----------------------------------------------------------*/
+            /* #endregion STEP 1: 提取数据包 -----------------------------------------------------------*/
 
-            /* #region STEP 2: Initialize orientation and Map -------------------------------------------------------*/
+            /* #region STEP 2: 初始化传感器方向和地图 -------------------------------------------------------*/
             
-            TicToc tt_init;
+            TicToc tt_init; // 初始化计时器
 
+            // 检查系统是否已完全初始化
             if (!ALL_INITED)
             {
-                InitSensorData(packet);
-                if (!ALL_INITED)
+                InitSensorData(packet); // 使用当前数据包初始化传感器数据
+                if (!ALL_INITED)        // 如果初始化未完成，继续下一次循环
                     continue;
             }
 
-            tt_init.Toc();
+            tt_init.Toc(); // 停止初始化计时
 
-            /* #endregion STEP 2: Initialize orientation and Map ----------------------------------------------------*/
+            /* #endregion STEP 2: 初始化传感器方向和地图 ----------------------------------------------------*/
 
-            /* #region STEP 3: Insert the data to the buffers -------------------------------------------------------*/
+            /* #region STEP 3: 将数据插入到缓冲区 -------------------------------------------------------*/
             
-            TicToc tt_insert;
+            TicToc tt_insert; // 数据插入计时器
 
-            // Extend the time steps
+            // 扩展时间步骤序列，添加新的时间段
             AddNewTimeStep(SwTimeStep, packet);
 
-            // Copy the pointcloud
-            SwCloud.push_back(CloudXYZITPtr(new CloudXYZIT()));
-            pcl::fromROSMsg(packet->extracted_cloud, *SwCloud.back());
+            // 复制点云数据到滑动窗口
+            SwCloud.push_back(CloudXYZITPtr(new CloudXYZIT())); // 创建新的点云容器
+            pcl::fromROSMsg(packet->extracted_cloud, *SwCloud.back()); // 从ROS消息转换点云
 
-            // Downsample the scan
+            // 对扫描进行下采样处理
             if(leaf_size > 0)
             {
-                pcl::UniformSampling<PointXYZIT> downsampler;
-                downsampler.setRadiusSearch(leaf_size);
-                downsampler.setInputCloud(SwCloud.back());
-                downsampler.filter(*SwCloud.back());
+                pcl::UniformSampling<PointXYZIT> downsampler;     // 均匀下采样器
+                downsampler.setRadiusSearch(leaf_size);           // 设置下采样半径
+                downsampler.setInputCloud(SwCloud.back());        // 设置输入点云
+                downsampler.filter(*SwCloud.back());              // 执行下采样过滤
             }
 
-            // Create the container for the latest pointcloud
+            // 为去畸变后的点云创建容器
             SwCloudDsk.push_back(CloudXYZIPtr(new CloudXYZI()));
 
-            // Create the container for the downsampled deskewed pointcloud
+            // 为下采样的去畸变点云创建容器
             SwCloudDskDS.push_back(CloudXYZIPtr(new CloudXYZI()));
 
-            // Buffer to store the coefficients of the lidar factors
+            // 存储激光雷达因子系数的缓冲区
             SwLidarCoef.push_back(vector<LidarCoef>());
 
-            // Buffer to count the number of associations per voxel
+            // 记录每个体素关联数量的缓冲区
             SwDepVsAssoc.push_back(map<int, int>());
 
-            // Add buffer the IMU samples at the last state
+            // 将IMU样本添加到最后状态的缓冲区
             AddImuToBuff(SwTimeStep, SwImuBundle, packet, regularize_imu);
 
-            // Imu propagated states
+            // IMU传播状态序列（每个时间步包含N_SUB_SEG个子段）
             SwPropState.push_back(deque<ImuProp>(N_SUB_SEG));
 
-            // Extend the spline
+            // 扩展B样条轨迹
             if (GlobalTraj == nullptr)
             {
+                // 首次创建全局轨迹样条
                 GlobalTraj = PoseSplinePtr(new PoseSplineX(SPLINE_N, deltaT));
                 GlobalTraj->setStartTime(SwTimeStep.front().front().start_time);
                 printf("Creating spline of order %d, dt %f s. Time: %f\n", SPLINE_N, deltaT, SwTimeStep.front().front().start_time);
             }
+            // 扩展样条节点到当前时间步的结束时间
             GlobalTraj->extendKnotsTo(SwTimeStep.back().back().final_time, SE3d());
             
-            tlog.t_insert = tt_insert.Toc();
+            tlog.t_insert = tt_insert.Toc(); // 记录数据插入时间
 
-            /* #endregion STEP 3: Insert the data to the buffers ----------------------------------------------------*/
+            /* #endregion STEP 3: 将数据插入到缓冲区 ----------------------------------------------------*/
 
-            /* #region STEP 4: IMU Propagation on the last segments -------------------------------------------------*/
+            /* #region STEP 4: 在最后的时间段上执行IMU传播 -------------------------------------------------*/
 
-            TicToc tt_imuprop;
+            TicToc tt_imuprop; // IMU传播计时器
 
+            // 遍历最新时间步中的所有子段，执行IMU传播
             for(int i = 0; i < SwImuBundle.back().size(); i++)
             {
-                auto &imuSubSeq = SwImuBundle.back()[i];
-                auto &subSegment = SwTimeStep.back()[i];
+                auto &imuSubSeq = SwImuBundle.back()[i];   // 当前子段的IMU数据序列
+                auto &subSegment = SwTimeStep.back()[i];   // 当前子段的时间信息
 
-                // ASSUMPTION: IMU data is not interrupted (any sub-segment should have IMU data), can be relaxed ?
+                // 假设条件：IMU数据不中断（任何子段都应该有IMU数据）
                 // printf("Step: %2d / %2d. imuSubSeq.size(): %d\n", i, SwImuBundle.back().size(), imuSubSeq.size());
                 ROS_ASSERT(!imuSubSeq.empty());
 
-                // ASSUMPTION: an IMU sample is interpolated at each segment's start and end point
+                // 假设条件：在每个段的开始和结束点都有插值的IMU样本
                 ROS_ASSERT_MSG(imuSubSeq.front().t == subSegment.start_time && imuSubSeq.back().t == subSegment.final_time,
                                "IMU Time: %f, %f. Seg. Time: %f, %f\n",
                                imuSubSeq.front().t, imuSubSeq.back().t, subSegment.start_time, subSegment.final_time);
 
+                // 使用初始状态和IMU数据执行传播
                 SwPropState.back()[i] = ImuProp(ssQua.back()[i], ssPos.back()[i], ssVel.back()[i],
                                                 ssBig.back()[i], ssBia.back()[i], GRAV, imuSubSeq);
 
-                sfQua.back()[i] = SwPropState.back()[i].Q.back();
-                sfPos.back()[i] = SwPropState.back()[i].P.back();
-                sfVel.back()[i] = SwPropState.back()[i].V.back();
+                // 提取传播后的终止状态
+                sfQua.back()[i] = SwPropState.back()[i].Q.back(); // 终止时刻的四元数
+                sfPos.back()[i] = SwPropState.back()[i].P.back(); // 终止时刻的位置
+                sfVel.back()[i] = SwPropState.back()[i].V.back(); // 终止时刻的速度
 
-                // Initialize start state of next segment with the final propogated state in the previous segment
+                // 用前一段的终止传播状态初始化下一段的开始状态
                 if (i <= SwImuBundle.back().size() - 2)
                 {
-                    ssQua.back()[i+1] = sfQua.back()[i];
-                    ssPos.back()[i+1] = sfPos.back()[i];
-                    ssVel.back()[i+1] = sfVel.back()[i];
+                    ssQua.back()[i+1] = sfQua.back()[i]; // 下一段开始的四元数
+                    ssPos.back()[i+1] = sfPos.back()[i]; // 下一段开始的位置
+                    ssVel.back()[i+1] = sfVel.back()[i]; // 下一段开始的速度
                 }
             }
 
-            tlog.t_prop.push_back(tt_imuprop.Toc());
+            tlog.t_prop.push_back(tt_imuprop.Toc()); // 记录IMU传播时间
 
-            /* #endregion STEP 4: IMU Propagation on the last segments ----------------------------------------------*/
+            /* #endregion STEP 4: 在最后的时间段上执行IMU传播 ----------------------------------------------*/
 
-            /* #region STEP 5: Intialize the extended part of the spline --------------------------------------------*/
+            /* #region STEP 5: 初始化样条的扩展部分 --------------------------------------------*/
 
-            TicToc tt_extspline;
+            TicToc tt_extspline; // 样条扩展计时器
             
-            static int last_updated_knot = -1;
+            static int last_updated_knot = -1; // 记录最后更新的节点索引
 
-            // Initialize the spline knots by the propagation value
+            // 使用传播值初始化样条节点
             int baseKnot = GlobalTraj->computeTIndex(SwPropState.back().front().t[0]).second + 1;
             for(int knot_idx = baseKnot; knot_idx < GlobalTraj->numKnots(); knot_idx++)
             {
-                // Initialize by linear interpolation
+                // 通过线性插值进行初始化
                 double knot_time = GlobalTraj->getKnotTime(knot_idx);
-                // Find the propagated pose
+                
+                // 查找传播的位姿
                 for(int seg_idx = 0; seg_idx < SwPropState.size(); seg_idx++)
                 {
                     for(int subseg_idx = 0; subseg_idx < SwPropState.back().size(); subseg_idx++)
                     {
+                        // 如果当前子段的结束时间小于节点时间，继续下一个
                         if(SwPropState.back()[subseg_idx].t.back() < knot_time)
                             continue;
 
+                        // 使用传播状态在节点时间的位姿设置节点值
                         GlobalTraj->setKnot(SwPropState.back()[subseg_idx].getTf(knot_time).getSE3(), knot_idx);
                         break;
                     }
                 }
 
-                // Initialize by copying the previous control point
+                // 通过复制前一个控制点进行初始化
                 if (GlobalTraj->getKnotTime(knot_idx) >= GlobalTraj->maxTime()
                     || GlobalTraj->getKnotTime(knot_idx) >= SwPropState.back().back().t.back())
                 {
                     // GlobalTraj->setKnot(SwPropState.back().back().getTf(knot_time, false).getSE3(), knot_idx);
-                    GlobalTraj->setKnot(GlobalTraj->getKnot(knot_idx-1), knot_idx);
+                    GlobalTraj->setKnot(GlobalTraj->getKnot(knot_idx-1), knot_idx); // 复制前一个节点的值
                     continue;
                 }
             }
             
-            // Fit the spline at the ending segment to avoid high cost
+            // 在结束段拟合样条以避免高成本
             std::thread threadFitSpline;
             if (fit_spline)
             {
                 static bool fit_spline_enabled = false;
+                // 当滑动窗口达到要求大小时启用样条拟合
                 if (SwTimeStep.size() >= WINDOW_SIZE && !fit_spline_enabled)
                     fit_spline_enabled = true;
                 else if(fit_spline_enabled)
-                    threadFitSpline = std::thread(&Estimator::FitSpline, this);
+                    threadFitSpline = std::thread(&Estimator::FitSpline, this); // 在新线程中执行样条拟合
             }
 
-            tt_extspline.Toc();
+            tt_extspline.Toc(); // 停止样条扩展计时
 
-            /* #endregion STEP 5: Intialize the extended part of the spline -----------------------------------------*/
+            /* #endregion STEP 5: 初始化样条的扩展部分 -----------------------------------------*/
 
-            // Loop if sliding window has not reached required length
+            // 检查滑动窗口是否达到所需长度，未达到则继续循环
             if (SwTimeStep.size() < WINDOW_SIZE)
             {
                 printf(KGRN "Buffer size %02d / %02d\n" RESET, SwTimeStep.size(), WINDOW_SIZE);
@@ -1431,172 +1458,187 @@ public:
                 }
             }
 
-            // Reset the association if ufomap has been updated
+            // 如果ufomap已更新，重置关联状态
             static int last_ufomap_version = ufomap_version;
             static bool first_round = true;
             if (ufomap_version != last_ufomap_version)
             {
-                first_round   = true;
+                first_round   = true;              // 标记为第一轮处理
                 last_ufomap_version = ufomap_version;
 
                 printf(KYEL "UFOMAP RESET.\n" RESET);
             }
 
-            /* #region STEP 6: DESKEW the pointcloud ----------------------------------------------------------------*/
+            /* #region STEP 6: 对点云进行去畸变处理 ----------------------------------------------------------------*/
             
-            string t_deskew;
-            double tt_deskew = 0;
+            string t_deskew;   // 去畸变时间报告字符串
+            double tt_deskew = 0; // 总去畸变时间
 
+            // 遍历滑动窗口中的帧，执行去畸变
             for (int i = first_round ? 0 : WINDOW_SIZE - 1; i < WINDOW_SIZE; i++)
             {
-                TicToc tt;
+                TicToc tt; // 单帧去畸变计时器
 
+                // 根据去畸变方法选择不同的处理方式
                 switch (deskew_method[0])
                 {
                     case 0:
+                        // 使用IMU数据进行去畸变
                         DeskewByImu(SwPropState[i], SwTimeStep[i], SwCloud[i], SwCloudDsk[i], SwCloudDskDS[i], assoc_spacing);
                         break;
                     case 1:
+                        // 使用B样条进行去畸变
                         DeskewBySpline(*GlobalTraj, SwTimeStep[i], SwCloud[i], SwCloudDsk[i], SwCloudDskDS[i], assoc_spacing);
                         break;
                     default:
                         break;
                 }
 
-                // Check the timing
+                // 记录计时信息
                 tt.Toc();
                 t_deskew  += myprintf("#%d: %3.1f, ", i, tt.GetLastStop());
                 tt_deskew += tt.GetLastStop();
             }
 
+            // 格式化去畸变时间报告
             t_deskew = myprintf("deskew: %3.1f, ", tt_deskew) + t_deskew;
 
-            tlog.t_desk.push_back(tt_deskew);
+            tlog.t_desk.push_back(tt_deskew); // 记录去畸变时间到日志
 
-            /* #endregion STEP 6: DESKEW the pointcloud -------------------------------------------------------------*/
+            /* #endregion STEP 6: 对点云进行去畸变处理 -------------------------------------------------------------*/
 
-            /* #region STEP 7: Associate scan with map --------------------------------------------------------------*/
+            /* #region STEP 7: 扫描与地图关联 --------------------------------------------------------------*/
             
-            string t_assoc;
-            double tt_assoc = 0;
+            string t_assoc;   // 关联时间报告字符串
+            double tt_assoc = 0; // 总关联时间
 
+            // 遍历滑动窗口中的帧，执行点云与地图的关联
             for (int i = first_round ? 0 : WINDOW_SIZE - 1; i < WINDOW_SIZE; i++)
             {
-                TicToc tt;
+                TicToc tt; // 单帧关联计时器
 
+                // 使用互斥锁保护地图数据，确保线程安全
                 lock_guard<mutex> lg(map_mtx);
-                SwDepVsAssoc[i].clear(); SwLidarCoef[i].clear();
+                SwDepVsAssoc[i].clear(); // 清空深度-关联计数映射
+                SwLidarCoef[i].clear();  // 清空激光雷达系数缓冲区
+                
+                // 执行点云与地图的关联，计算观测残差和雅可比
                 AssociateCloudWithMap(*activeSurfelMap, activeikdtMap, mytf(sfQua[i].back(), sfPos[i].back()),
                                        SwCloud[i], SwCloudDskDS[i], SwLidarCoef[i], SwDepVsAssoc[i]);
 
-                // Check the timing
+                // 记录计时信息
                 tt.Toc();
                 t_assoc  += myprintf("#%d: %3.1f, ", i, tt.GetLastStop());
                 tt_assoc += tt.GetLastStop();
             }
             
+            // 格式化关联时间报告
             t_assoc = myprintf("assoc: %3.1f, ", tt_assoc) + t_assoc;
 
-            tlog.t_assoc.push_back(tt_assoc);
+            tlog.t_assoc.push_back(tt_assoc); // 记录关联时间到日志
 
-            // find_new_node = false;
+            // find_new_node = false; // 调试用代码（已注释）
 
-            /* #endregion STEP 7: Associate scan with map -----------------------------------------------------------*/
+            /* #endregion STEP 7: 扫描与地图关联 -----------------------------------------------------------*/
 
-            /* #region STEP 8: LIO optimizaton ----------------------------------------------------------------------*/
+            /* #region STEP 8: 激光雷达-惯导融合优化 ----------------------------------------------------------------------*/
 
-            tt_preopt.Toc();
+            tt_preopt.Toc(); // 结束预优化计时
 
-            static int optNum = 0; optNum++;
-            vector<slict::OptStat> optreport(max_outer_iters);
+            static int optNum = 0; optNum++; // 优化计数器
+            vector<slict::OptStat> optreport(max_outer_iters); // 优化报告数组
             for (auto &report : optreport)
                 report.OptNum = optNum;
 
-            // Update the time check
+            // 更新时间日志检查
             tlog.OptNum = optNum;
             tlog.header.stamp = ros::Time(SwTimeStep.back().back().final_time);
 
-            string printout, lioop_times_report = "", DVAReport;
+            string printout, lioop_times_report = "", DVAReport; // 输出报告字符串
 
+            // 外层优化循环
             int outer_iter = max_outer_iters;
             while(true)
             {
-                // Decrement outer interation counter
+                // 递减外层迭代计数器
                 outer_iter--;
 
-                // Prepare a report
+                // 准备当前迭代的报告
                 slict::OptStat &report = optreport[outer_iter];
 
-                // Calculate the downsampling rate at each depth            
+                // 计算各深度层级的下采样率
                 makeDVAReport(SwDepVsAssoc, DVA, total_lidar_coef, DVAReport);
                 lidar_ds_rate = (max_lidar_factor == -1 ? 1 : max(1, (int)std::floor( (double)total_lidar_coef/max_lidar_factor) ));
 
                 // if(threadFitSpline.joinable())
                 //     threadFitSpline.join();
 
-                // Create a local spline to store the new knots, isolating the poses from the global trajectory
+                // 创建局部样条来存储新的节点，将位姿从全局轨迹中分离出来
                 PoseSplineX LocalTraj(SPLINE_N, deltaT);
-                int swBaseKnot = GlobalTraj->computeTIndex(SwImuBundle[0].front().front().t).second;
-                int swNextBase = GlobalTraj->computeTIndex(SwImuBundle[1].front().front().t).second;
+                int swBaseKnot = GlobalTraj->computeTIndex(SwImuBundle[0].front().front().t).second; // 滑动窗口基础节点索引
+                int swNextBase = GlobalTraj->computeTIndex(SwImuBundle[1].front().front().t).second; // 下一个基础节点索引
 
-                static map<int, int> prev_knot_x;
-                static map<int, int> curr_knot_x;
+                static map<int, int> prev_knot_x; // 前一次的节点索引映射
+                static map<int, int> curr_knot_x; // 当前的节点索引映射
 
-                double swStartTime = GlobalTraj->getKnotTime(swBaseKnot);
-                double swFinalTime = SwTimeStep.back().back().final_time - 1e-3; // Add a small offset to avoid localtraj having extra knots due to rounding error
+                double swStartTime = GlobalTraj->getKnotTime(swBaseKnot);              // 滑动窗口开始时间
+                double swFinalTime = SwTimeStep.back().back().final_time - 1e-3;      // 滑动窗口结束时间（减小偏移避免舍入误差）
 
-                LocalTraj.setStartTime(swStartTime);
-                LocalTraj.extendKnotsTo(swFinalTime, SE3d());
+                LocalTraj.setStartTime(swStartTime);                    // 设置局部轨迹开始时间
+                LocalTraj.extendKnotsTo(swFinalTime, SE3d());           // 扩展局部轨迹节点到结束时间
 
-                // Copy the knots value from global to local traj
+                // 从全局轨迹复制节点值到局部轨迹
                 for(int knot_idx = swBaseKnot; knot_idx < GlobalTraj->numKnots(); knot_idx++)
                 {
+                    // 检查索引边界，避免越界
                     if ((knot_idx - swBaseKnot) > LocalTraj.numKnots() - 1)
                         continue;
                     LocalTraj.setKnot(GlobalTraj->getKnot(knot_idx), knot_idx - swBaseKnot);
                 }
 
-                // Check insantity
+                // 检查节点数量的合理性
                 ROS_ASSERT_MSG(LocalTraj.numKnots() <= GlobalTraj->numKnots() - swBaseKnot,
                                "Knot count not matching %d, %d, %d\n",
                                LocalTraj.numKnots(), GlobalTraj->numKnots() - swBaseKnot, swBaseKnot);
 
-                // Accounting for the knot idx for marginalization
+                // 为边际化记录节点索引映射
                 curr_knot_x.clear();
                 for(int knot_idx = 0; knot_idx < LocalTraj.numKnots(); knot_idx++)
                     curr_knot_x[knot_idx + swBaseKnot] = knot_idx;
 
-                TicToc tt_feaSel;
-                // Select the features
-                vector<ImuIdx> imuSelected;
-                vector<lidarFeaIdx> featureSelected;
+                TicToc tt_feaSel; // 特征选择计时器
+                
+                // 选择用于优化的特征
+                vector<ImuIdx> imuSelected;        // 选中的IMU因子索引
+                vector<lidarFeaIdx> featureSelected; // 选中的激光雷达特征索引
                 FactorSelection(LocalTraj, imuSelected, featureSelected);
-                // Visualize the selection
+                
+                // 可视化选中的特征
                 PublishAssocCloud(featureSelected, SwLidarCoef);
                 tt_feaSel.Toc();
 
-                tlog.t_feasel.push_back(tt_feaSel.GetLastStop());
+                tlog.t_feasel.push_back(tt_feaSel.GetLastStop()); // 记录特征选择时间
 
-                // Optimization
+                // 执行激光雷达-惯导融合优化
                 lioop_times_report = "";
                 LIOOptimization(report, lioop_times_report, LocalTraj,
                                 prev_knot_x, curr_knot_x, swNextBase, outer_iter,
                                 imuSelected, featureSelected, tlog);
 
-                // Load the knot values back to the global traj
+                // 将优化后的节点值加载回全局轨迹
                 for(int knot_idx = 0; knot_idx < LocalTraj.numKnots(); knot_idx++)
                 {
                     GlobalTraj->setKnot(LocalTraj.getKnot(knot_idx), knot_idx + swBaseKnot);
                     last_updated_knot = knot_idx + swBaseKnot;
                 }
 
-                /* #region Post optimization ------------------------------------------------------------------------*/
+                /* #region 优化后处理 ------------------------------------------------------------------------*/
 
-                TicToc tt_posproc;
+                TicToc tt_posproc; // 后处理计时器
 
-                string pstop_times_report = "pp: ";
+                string pstop_times_report = "pp: "; // 后处理时间报告
 
-                // Break the loop early if the optimization finishes quickly.
+                // 如果优化快速完成，提前跳出循环
                 bool redo_optimization = true;
                 if (outer_iter <= 0
                     || (outer_iter <= max_outer_iters - 2
@@ -1606,18 +1648,21 @@ public:
                     redo_optimization = false;
 
                 // int PROP_THREADS = std::min(WINDOW_SIZE, MAX_THREADS);
-                // Redo propagation
+                // 重新执行IMU传播
 
-                TicToc tt_prop_;
+                TicToc tt_prop_; // 传播计时器
 
+                // 使用并行处理重新计算所有滑动窗口帧的IMU传播
                 #pragma omp parallel for num_threads(WINDOW_SIZE)
                 for (int i = 0; i < WINDOW_SIZE; i++)
                 {
                     for(int j = 0; j < SwTimeStep[i].size(); j++)
                     {
+                        // 使用优化后的状态重新执行IMU传播
                         SwPropState[i][j] = ImuProp(sfQua[i][j], sfPos[i][j], sfVel[i][j],
                                                     sfBig[i][j], sfBia[i][j], GRAV, SwImuBundle[i][j], -1);
 
+                        // 更新第一帧第一段的起始状态
                         if (i == 0 && j == 0)
                         {
                             ssQua[i][j] = SwPropState[i][j].Q.front();
@@ -1627,47 +1672,52 @@ public:
                     }
                 }
 
-                tlog.t_prop.push_back(tt_prop_.Toc());
-                pstop_times_report += myprintf("prop: %.1f, ", tlog.t_prop.back());
+                tlog.t_prop.push_back(tt_prop_.Toc());                         // 记录传播时间
+                pstop_times_report += myprintf("prop: %.1f, ", tlog.t_prop.back()); // 添加到报告
 
-                TicToc tt_deskew_;
+                TicToc tt_deskew_; // 重新去畸变计时器
 
-                // Redo the deskew
+                // 重新执行点云去畸变
                 if(lite_redeskew)
-                    if (redo_optimization)  // If optimization is gonna be done again, deskew with light method
+                    if (redo_optimization)  // 如果还要再次优化，使用轻量级去畸变方法
                         for (int i = first_round ? 0 : max(0, WINDOW_SIZE - reassociate_steps); i < WINDOW_SIZE; i++)
                             Redeskew(SwPropState[i], SwTimeStep[i], SwCloud[i], SwCloudDskDS[i]);
-                    else                    // If optimization is not gonna be done again, deskew with heavy method
+                    else                    // 如果不再优化，使用完整的去畸变方法
                         for (int i = first_round ? 0 : max(0, WINDOW_SIZE - reassociate_steps); i < WINDOW_SIZE; i++)
                             DeskewByImu(SwPropState[i], SwTimeStep[i], SwCloud[i], SwCloudDsk[i], SwCloudDskDS[i], assoc_spacing);
                 else
+                    // 始终使用完整的IMU去畸变方法
                     for (int i = first_round ? 0 : max(0, WINDOW_SIZE - reassociate_steps); i < WINDOW_SIZE; i++)
                         DeskewByImu(SwPropState[i], SwTimeStep[i], SwCloud[i], SwCloudDsk[i], SwCloudDskDS[i], assoc_spacing);
 
-                tlog.t_desk.push_back(tt_deskew_.Toc());
-                pstop_times_report += myprintf("dsk: %.1f, ", tlog.t_desk.back());
+                tlog.t_desk.push_back(tt_deskew_.Toc());                        // 记录去畸变时间
+                pstop_times_report += myprintf("dsk: %.1f, ", tlog.t_desk.back()); // 添加到报告
 
-                TicToc tt_assoc_;
+                TicToc tt_assoc_; // 重新关联计时器
     
-                // Redo the map association
+                // 重新执行地图关联
                 for (int i = first_round ? 0 : max(0, WINDOW_SIZE - reassociate_steps); i < WINDOW_SIZE; i++)
                 {
-                    // TicToc tt_assoc;
+                    // TicToc tt_assoc; // 调试用计时器（已注释）
                     
+                    // 使用互斥锁保护地图数据
                     lock_guard<mutex> lg(map_mtx);
-                    SwDepVsAssoc[i].clear(); SwLidarCoef[i].clear();
+                    SwDepVsAssoc[i].clear(); // 清空深度-关联计数映射
+                    SwLidarCoef[i].clear();  // 清空激光雷达系数缓冲区
+                    
+                    // 重新执行点云与地图的关联
                     AssociateCloudWithMap(*activeSurfelMap, activeikdtMap, mytf(sfQua[i].back(), sfPos[i].back()),
                                            SwCloud[i], SwCloudDskDS[i], SwLidarCoef[i], SwDepVsAssoc[i]);
 
-                    // printf("Assoc Time: %f\n", tt_assoc.Toc());
+                    // printf("Assoc Time: %f\n", tt_assoc.Toc()); // 调试输出（已注释）
                 }
 
-                tlog.t_assoc.push_back(tt_assoc_.Toc());
-                pstop_times_report += myprintf("assoc: %.1f, ", tlog.t_assoc.back());
+                tlog.t_assoc.push_back(tt_assoc_.Toc());                          // 记录关联时间
+                pstop_times_report += myprintf("assoc: %.1f, ", tlog.t_assoc.back()); // 添加到报告
 
-                tt_posproc.Toc();
+                tt_posproc.Toc(); // 结束后处理计时
 
-                /* #endregion Post optimization ---------------------------------------------------------------------*/
+                /* #endregion 优化后处理 ---------------------------------------------------------------------*/
 
                 /* #region Write the report -------------------------------------------------------------------------*/
 
@@ -1802,149 +1852,160 @@ public:
 
             /* #endregion STEP 8: LIO optimizaton -------------------------------------------------------------------*/
 
-            /* #region STEP 9: Recruit Keyframe ---------------------------------------------------------------------*/
+            /* #region STEP 9: 关键帧招募 ---------------------------------------------------------------------*/
             
-            NominateKeyframe();
+            NominateKeyframe(); // 根据当前状态决定是否添加新的关键帧
 
-            /* #endregion STEP 9: Recruit Keyframe ------------------------------------------------------------------*/
+            /* #endregion STEP 9: 关键帧招募 ------------------------------------------------------------------*/
 
-            /* #region STEP 9: Loop Closure and BA ------------------------------------------------------------------*/
+            /* #region STEP 10: 闭环检测和束调整 ------------------------------------------------------------------*/
 
-            tt_loopBA.Tic();
+            tt_loopBA.Tic(); // 闭环检测和束调整计时器
 
+            // 如果启用闭环检测
             if (loop_en)
             {
-                DetectLoop();
-                BundleAdjustment(baReport);
+                DetectLoop();                // 检测闭环约束
+                BundleAdjustment(baReport);  // 执行全局束调整优化
             }
 
-            tt_loopBA.Toc();
+            tt_loopBA.Toc(); // 结束闭环检测和束调整计时
 
-            /* #endregion STEP 9: Loop Closure and BA ---------------------------------------------------------------*/
+            /* #endregion STEP 10: 闭环检测和束调整 ---------------------------------------------------------------*/
 
-            /* #region STEP 11: Report and Vizualize ----------------------------------------------------------------*/ 
+            /* #region STEP 11: 报告输出和可视化 ----------------------------------------------------------------*/ 
             
-            // Export the summaries
+            // 输出优化报告摘要
             if (show_report)
                 cout << printout;
 
+            // 多线程可视化（已注释，改为同步执行）
             // std::thread vizSwTrajThread(&Estimator::VisualizeSwTraj, this);            
             // std::thread vizSwLoopThread(&Estimator::VisualizeLoop, this);
             
             // vizSwTrajThread.join();
             // vizSwLoopThread.join();
 
-            VisualizeSwTraj();
-            VisualizeLoop();
+            VisualizeSwTraj(); // 可视化滑动窗口轨迹
+            VisualizeLoop();   // 可视化闭环约束
 
             /* #endregion STEP 11: Report and Vizualize -------------------------------------------------------------*/ 
 
-            /* #region STEP 12: Slide window forward ----------------------------------------------------------------*/
+            /* #region STEP 12: 滑动窗口前移 ----------------------------------------------------------------*/
 
-            // Slide the window forward
+            // 将滑动窗口向前滑动，移除最旧的数据
             SlideWindowForward();
 
-            /* #endregion STEP 12: Slide window forward -------------------------------------------------------------*/
+            /* #endregion STEP 12: 滑动窗口前移 -------------------------------------------------------------*/
 
-            /* #region STEP 13: Transform everything to prior map frame ---------------------------------------------*/
+            /* #region STEP 13: 转换到先验地图坐标系 ---------------------------------------------*/
 
-            // Simulated behaviours
+            // 模拟重定位行为：如果使用先验地图且尚未重定位但有重定位缓冲区数据
             if (use_prior_map && reloc_stat != RELOCALIZED && relocBuf.size() != 0)
             {
-                // Extract the relocalization pose
+                // 提取重定位位姿
                 {
-                    lock_guard<mutex>lg(relocBufMtx);
-                    tf_Lprior_L0 = relocBuf.back();
+                    lock_guard<mutex>lg(relocBufMtx);  // 保护重定位缓冲区
+                    tf_Lprior_L0 = relocBuf.back();    // 获取最新的重定位变换
                 }
 
-                // Move all states to the new coordinates
-                Quaternd q_Lprior_L0 = tf_Lprior_L0.rot;
-                Vector3d p_Lprior_L0 = tf_Lprior_L0.pos;
+                // 将所有状态转换到新坐标系
+                Quaternd q_Lprior_L0 = tf_Lprior_L0.rot;  // 重定位旋转
+                Vector3d p_Lprior_L0 = tf_Lprior_L0.pos;  // 重定位平移
 
-                // Transform the traj to the prior map
+                // 将轨迹转换到先验地图坐标系
                 for(int knot_idx = 0; knot_idx < GlobalTraj->numKnots(); knot_idx++)
                     GlobalTraj->setKnot(tf_Lprior_L0.getSE3()*GlobalTraj->getKnot(knot_idx), knot_idx);
 
-                // Convert all the IMU poses to the prior map
+                // 将所有IMU位姿转换到先验地图坐标系
                 for(int i = 0; i < SwPropState.size(); i++)
                 {
                     for(int j = 0; j < SwPropState[i].size(); j++)
                     {
                         for (int k = 0; k < SwPropState[i][j].size(); k++)
                         {
+                            // 旋转变换：q' = q_transform * q_original
                             SwPropState[i][j].Q[k] = q_Lprior_L0*SwPropState[i][j].Q[k];
+                            // 位置变换：p' = q_transform * p_original + t_transform
                             SwPropState[i][j].P[k] = q_Lprior_L0*SwPropState[i][j].P[k] + p_Lprior_L0;
+                            // 速度变换：v' = q_transform * v_original
                             SwPropState[i][j].V[k] = q_Lprior_L0*SwPropState[i][j].V[k];
                         }
                     }
                 }
 
+                // 转换起始和终止状态到先验地图坐标系
                 for(int i = 0; i < ssQua.size(); i++)
                 {
                     for(int j = 0; j < ssQua[i].size(); j++)
                     {
+                        // 起始状态转换
                         ssQua[i][j] = q_Lprior_L0*ssQua[i][j];
                         ssPos[i][j] = q_Lprior_L0*ssPos[i][j] + p_Lprior_L0;
                         ssVel[i][j] = q_Lprior_L0*ssVel[i][j];
 
+                        // 终止状态转换
                         sfQua[i][j] = q_Lprior_L0*sfQua[i][j];
                         sfPos[i][j] = q_Lprior_L0*sfPos[i][j] + p_Lprior_L0;
                         sfVel[i][j] = q_Lprior_L0*sfVel[i][j];
                     }
                 }
 
-                // Keyframe poses
+                // 转换关键帧位姿到先验地图坐标系
                 pcl::transformPointCloud(*KfCloudPose, *KfCloudPose, tf_Lprior_L0.cast<float>().tfMat());
                 
-                // Clear the coef of previous steps
+                // 清除之前步骤的关联系数
                 for(int i = 0; i < SwLidarCoef.size(); i++)
                 {
-                    SwLidarCoef[i].clear();
-                    SwDepVsAssoc[i].clear();
+                    SwLidarCoef[i].clear();    // 清空激光雷达系数
+                    SwDepVsAssoc[i].clear();   // 清空深度-关联映射
                 }
                 
-                // Update the priors of the prior factor
+                // 更新先验因子的先验值
                 mySolver->RelocalizePrior(tf_Lprior_L0.getSE3());
 
-                // Change the map
+                // 切换到先验地图
                 {
-                    lock_guard<mutex> lg(map_mtx);
+                    lock_guard<mutex> lg(map_mtx);  // 保护地图数据
                     
                     if(use_ufm)
-                        activeSurfelMap = priorSurfelMapPtr;
+                        activeSurfelMap = priorSurfelMapPtr;  // 切换到先验surfel地图
                     else
-                        activeikdtMap = priorikdtMapPtr;
+                        activeikdtMap = priorikdtMapPtr;      // 切换到先验ikd-tree地图
 
-                    ufomap_version++;
+                    ufomap_version++;  // 增加地图版本号，触发重新关联
                 }
 
-                // Clear the previous keyframe
+                // 转换之前的关键帧点云到先验地图坐标系
                 #pragma omp parallel for num_threads(MAX_THREADS)
                 for(int i = 0; i < KfCloudPose->size(); i++)
                     pcl::transformPointCloud(*KfCloudinW[i], *KfCloudinW[i], tf_Lprior_L0.cast<float>().tfMat());
 
-                // Add keyframe pointcloud to global map
+                // 清空全局地图并准备重新构建
                 {
-                    lock_guard<mutex> lock(global_map_mtx);
+                    lock_guard<mutex> lock(global_map_mtx);  // 保护全局地图
                     globalMap->clear();
                 }
 
-                // Log down the relocalization information
-                Matrix4d tfMat_L0_Lprior = tf_Lprior_L0.inverse().tfMat();
-                Matrix4d tfMat_Lprior_L0 = tf_Lprior_L0.tfMat();
+                // 记录重定位信息到日志文件
+                Matrix4d tfMat_L0_Lprior = tf_Lprior_L0.inverse().tfMat();  // L0到Lprior的变换矩阵
+                Matrix4d tfMat_Lprior_L0 = tf_Lprior_L0.tfMat();            // Lprior到L0的变换矩阵
 
+                // 保存从L0到先验地图的变换矩阵
                 ofstream prior_fwtf_file;
                 prior_fwtf_file.open((log_dir + string("/tf_L0_Lprior.txt")).c_str());
                 prior_fwtf_file << std::fixed << std::setprecision(9);
                 prior_fwtf_file << tfMat_L0_Lprior;
                 prior_fwtf_file.close();
 
+                // 保存从先验地图到L0的变换矩阵
                 ofstream prior_rvtf_file;
                 prior_rvtf_file.open((log_dir + string("/tf_Lprior_L0.txt")).c_str());
                 prior_rvtf_file << std::fixed << std::setprecision(9);
                 prior_rvtf_file << tfMat_Lprior_L0;
                 prior_rvtf_file.close();
 
+                // 保存重定位详细信息到CSV文件
                 ofstream reloc_info_file;
                 reloc_info_file.open((log_dir + string("/reloc_info.csv")).c_str());
                 reloc_info_file << std::fixed << std::setprecision(9);
@@ -1952,26 +2013,26 @@ public:
                                 << "TF_Lprior_L0.x, TF_Lprior_L0.y, TF_Lprior_L0.z, "
                                 << "TF_Lprior_L0.qx, TF_Lprior_L0.qy, TF_Lprior_L0.qz, TF_Lprior_L0.qw, "
                                 << "TF_Lprior_L0.yaw, TF_Lprior_L0.pitch, TF_Lprior_L0.roll"  << endl;
-                reloc_info_file << SwTimeStep.back().back().final_time << ", "
-                                << tf_Lprior_L0.pos.x() << ", " << tf_Lprior_L0.pos.y() << ", " << tf_Lprior_L0.pos.z() << ", "
-                                << tf_Lprior_L0.rot.x() << ", " << tf_Lprior_L0.rot.y() << ", " << tf_Lprior_L0.rot.z() << ", " << tf_Lprior_L0.rot.w() << ", "
-                                << tf_Lprior_L0.yaw()   << ", " << tf_Lprior_L0.pitch() << ", " << tf_Lprior_L0.roll()  << endl;
+                reloc_info_file << SwTimeStep.back().back().final_time << ", "  // 时间戳
+                                << tf_Lprior_L0.pos.x() << ", " << tf_Lprior_L0.pos.y() << ", " << tf_Lprior_L0.pos.z() << ", "      // 位置
+                                << tf_Lprior_L0.rot.x() << ", " << tf_Lprior_L0.rot.y() << ", " << tf_Lprior_L0.rot.z() << ", " << tf_Lprior_L0.rot.w() << ", " // 四元数
+                                << tf_Lprior_L0.yaw()   << ", " << tf_Lprior_L0.pitch() << ", " << tf_Lprior_L0.roll()  << endl;    // 欧拉角
                 reloc_info_file.close();
 
-                // Change the frame of reference
+                // 更改参考坐标系
                 current_ref_frame = "map";
 
-                reloc_stat = RELOCALIZED;
+                reloc_stat = RELOCALIZED; // 标记为已重定位
             }
 
-            /* #endregion STEP 13: Transform everything to prior map frame ------------------------------------------*/
+            /* #endregion STEP 13: 转换到先验地图坐标系 ------------------------------------------*/
 
-            // Publish the loop time
+            // 发布主循环时间日志
             tlog.t_loop = tt_whileloop.Toc();
             static ros::Publisher tlog_pub = nh_ptr->advertise<slict::TimeLog>("/time_log", 100);
             tlog_pub.publish(tlog);
         }
-    }
+    } // ProcessData() 函数结束
 
     void PublishAssocCloud(vector<lidarFeaIdx> &featureSelected, deque<vector<LidarCoef>> &SwLidarCoef)
     {
@@ -1992,174 +2053,249 @@ public:
         Util::publishCloud(assoc_cloud_pub, *assocCloud, ros::Time(SwTimeStep.back().back().final_time), current_ref_frame);
     }
 
+    /**
+     * 传感器数据初始化函数
+     * 功能描述：初始化IMU和激光雷达传感器，计算IMU偏置和初始姿态
+     * @param packet 输入的特征点云数据包，包含IMU数据和激光雷达数据
+     * 主要步骤：
+     *   1. IMU初始化：计算陀螺仪偏置、加速度计标定、初始姿态估计
+     *   2. 激光雷达初始化：处理第一帧点云、创建初始关键帧
+     *   3. 检查初始化完成状态
+     */
     void InitSensorData(slict::FeatureCloud::ConstPtr &packet)
     {
-        static bool IMU_INITED = false;
-        static bool LIDAR_INITED = false;
+        static bool IMU_INITED = false;    // IMU初始化状态标志
+        static bool LIDAR_INITED = false;  // 激光雷达初始化状态标志
 
+        // ============= IMU传感器初始化 =============
         if (!IMU_INITED)
         {
-            const vector<sensor_msgs::Imu> &imu_bundle = packet->imu_msgs;
+            const vector<sensor_msgs::Imu> &imu_bundle = packet->imu_msgs; // 获取IMU数据束
 
-            static vector<Vector3d> gyr_buf;
-            static vector<Vector3d> acc_buf;
-            static double first_imu_time = imu_bundle.front().header.stamp.toSec();
+            // 静态缓冲区，用于累积IMU数据进行统计计算
+            static vector<Vector3d> gyr_buf;  // 陀螺仪数据缓冲区
+            static vector<Vector3d> acc_buf;  // 加速度计数据缓冲区
+            static double first_imu_time = imu_bundle.front().header.stamp.toSec(); // 第一个IMU数据的时间戳
 
-            // Push the sample into buffer;
+            // 将IMU样本推入缓冲区进行累积
             for (auto imu_sample : imu_bundle)
             {
+                // 只处理序列号为0的IMU数据（可能是数据筛选条件）
                 if (imu_sample.header.seq == 0)
                 {
+                    // 提取陀螺仪角速度数据
                     gyr_buf.push_back(Vector3d(imu_sample.angular_velocity.x,
                                                imu_sample.angular_velocity.y,
                                                imu_sample.angular_velocity.z));
+                    // 提取加速度计线性加速度数据
                     acc_buf.push_back(Vector3d(imu_sample.linear_acceleration.x,
                                                imu_sample.linear_acceleration.y,
                                                imu_sample.linear_acceleration.z));
                 }
             }
 
-            // Average the IMU measurements and initialize the states
+            // 当累积足够的IMU数据且时间间隔达到初始化要求时，进行IMU参数计算
             if (!gyr_buf.empty() &&
                 fabs(imu_bundle.front().header.stamp.toSec() - first_imu_time) > imu_init_time)
             {
-                // Calculate the gyro bias
-                Vector3d gyr_avr(0, 0, 0);
+                // ========== 计算陀螺仪偏置 ==========
+                Vector3d gyr_avr(0, 0, 0);  // 陀螺仪平均值，用于估计偏置
                 for (auto gyr_sample : gyr_buf)
-                    gyr_avr += gyr_sample;
+                    gyr_avr += gyr_sample;   // 累加所有陀螺仪测量值
 
-                gyr_avr /= gyr_buf.size();
+                gyr_avr /= gyr_buf.size();   // 计算平均值作为陀螺仪偏置估计
 
-                // Calculate the original orientation
-                Vector3d acc_avr(0, 0, 0);
+                // ========== 计算初始姿态 ==========
+                Vector3d acc_avr(0, 0, 0);  // 加速度计平均值，用于估计重力方向
                 for (auto acc_sample : acc_buf)
-                    acc_avr += acc_sample;
+                    acc_avr += acc_sample;   // 累加所有加速度计测量值
 
-                acc_avr /= acc_buf.size();
+                acc_avr /= acc_buf.size();   // 计算平均值
 
+                // 计算加速度计标定系数（理论重力与测量重力的比值）
                 ACC_SCALE = GRAV.norm()/acc_avr.norm();
                 
+                // 根据重力方向估计初始姿态四元数
                 Quaternd q_init(Util::grav2Rot(acc_avr));
-                Vector3d ypr = Util::Quat2YPR(q_init);
+                Vector3d ypr = Util::Quat2YPR(q_init);  // 转换为欧拉角用于显示
 
+                // 输出初始化结果信息
                 printf("Gyro Bias: %.3f, %.3f, %.3f. Samples: %d. %d\n",
                         gyr_avr(0), gyr_avr(1), gyr_avr(2), gyr_buf.size(), acc_buf.size());
                 printf("Init YPR:  %.3f, %.3f, %.3f.\n", ypr(0), ypr(1), ypr(2));
 
-                // Initialize the original quaternion state
+                // ========== 初始化滑动窗口状态变量 ==========
+                // 初始化起始和终止姿态四元数（所有窗口和子段都使用相同的初始姿态）
                 ssQua = sfQua = deque<deque<Quaternd>>(WINDOW_SIZE, deque<Quaternd>(N_SUB_SEG, q_init));
+                // 初始化陀螺仪偏置（使用计算出的偏置值）
                 ssBig = sfBig = deque<deque<Vector3d>>(WINDOW_SIZE, deque<Vector3d>(N_SUB_SEG, gyr_avr));
+                // 初始化加速度计偏置（设为零向量）
                 ssBia = sfBia = deque<deque<Vector3d>>(WINDOW_SIZE, deque<Vector3d>(N_SUB_SEG, Vector3d(0, 0, 0)));
 
-                IMU_INITED = true;
+                IMU_INITED = true;  // 标记IMU初始化完成
             }
         }
     
+        // ============= 激光雷达传感器初始化 =============
         if (!LIDAR_INITED)
         {
+            // 静态点云容器，用于存储第一帧激光雷达数据
             static CloudXYZITPtr kfCloud0_(new CloudXYZIT());
-            pcl::fromROSMsg(packet->extracted_cloud, *kfCloud0_);
+            pcl::fromROSMsg(packet->extracted_cloud, *kfCloud0_);  // 从ROS消息转换为PCL点云
 
+            // 只有IMU初始化完成后才能进行激光雷达初始化（需要初始姿态信息）
             if(IMU_INITED)
             {   
-                // Downsample the cached kf data
-                pcl::UniformSampling<PointXYZIT> downsampler;
-                downsampler.setRadiusSearch(leaf_size);
-                downsampler.setInputCloud(kfCloud0_);
-                downsampler.filter(*kfCloud0_);
+                // ========== 点云下采样处理 ==========
+                pcl::UniformSampling<PointXYZIT> downsampler;  // 创建均匀下采样器
+                downsampler.setRadiusSearch(leaf_size);        // 设置下采样半径
+                downsampler.setInputCloud(kfCloud0_);          // 设置输入点云
+                downsampler.filter(*kfCloud0_);                // 执行下采样过滤
 
-                // Admitting only latest 0.09s part of the pointcloud
+                // ========== 时间窗口裁剪 ==========
+                // 只保留最近0.09秒的点云数据，减少计算负担并保证数据时效性
                 printf("PointTime: %f -> %f\n", kfCloud0_->points.front().t, kfCloud0_->points.back().t);
-                CloudXYZIPtr kfCloud0(new CloudXYZI());
+                CloudXYZIPtr kfCloud0(new CloudXYZI());  // 创建裁剪后的点云容器（不含时间戳）
                 for(PointXYZIT &p : kfCloud0_->points)
                 {
+                    // 只保留时间戳在最后0.09秒内的点
                     if(p.t > kfCloud0_->points.back().t - 0.09)
                     {
-                        PointXYZI pnew;
+                        PointXYZI pnew;  // 创建新的点（去掉时间戳）
                         pnew.x = p.x; pnew.y = p.y; pnew.z = p.z; pnew.intensity = p.intensity;
                         kfCloud0->push_back(pnew);   
                     }
                 }
 
-                // Key frame cloud in world
-                CloudXYZIPtr kfCloud0InW(new CloudXYZI());
+                // ========== 坐标变换到世界坐标系 ==========
+                CloudXYZIPtr kfCloud0InW(new CloudXYZI());  // 世界坐标系下的关键帧点云
+                // 使用IMU初始化得到的姿态将点云从传感器坐标系变换到世界坐标系
                 pcl::transformPointCloud(*kfCloud0, *kfCloud0InW, Vector3d(0, 0, 0), sfQua[0].back());
 
-                // Admit the pointcloud to buffer
-                AdmitKeyframe(packet->header.stamp.toSec(), sfQua[0].back(), Vector3d(0, 0, 0), kfCloud0, kfCloud0InW);
+                // ========== 创建初始关键帧 ==========
+                // 将处理后的点云作为第一个关键帧添加到系统中
+                AdmitKeyframe(packet->header.stamp.toSec(),   // 时间戳
+                             sfQua[0].back(),                 // 姿态四元数
+                             Vector3d(0, 0, 0),               // 位置（初始设为原点）
+                             kfCloud0,                        // 传感器坐标系点云
+                             kfCloud0InW);                    // 世界坐标系点云
 
-                // Write the file for quick visualization
-                PCDWriter writer; writer.writeASCII<PointPose>(log_dir + "/KfCloudPose.pcd", *KfCloudPose, 18);
+                // ========== 保存关键帧位姿信息 ==========
+                // 写入PCD文件用于快速可视化和调试
+                PCDWriter writer; 
+                writer.writeASCII<PointPose>(log_dir + "/KfCloudPose.pcd", *KfCloudPose, 18);
 
-                LIDAR_INITED = true;
+                LIDAR_INITED = true;  // 标记激光雷达初始化完成
             }
         }
 
+        // ========== 检查初始化完成状态 ==========
+        // 只有当IMU和激光雷达都初始化完成后，整个传感器系统才算初始化完成
         if (IMU_INITED && LIDAR_INITED)
             ALL_INITED = true;
-    }
+    } // InitSensorData() 函数结束
 
+    /**
+     * 添加新时间步骤函数
+     * 功能描述：向滑动窗口时间步骤队列添加新的时间段，并将其分割为多个子段
+     * @param timeStepDeque 时间步骤双端队列（二维结构：每个元素包含多个时间子段）
+     * @param packet 输入的特征点云数据包，包含扫描开始和结束时间
+     * 主要步骤：
+     *   1. 创建新的时间子段序列容器
+     *   2. 根据当前时间步骤状态计算时间参数
+     *   3. 将时间段均匀分割为N_SUB_SEG个子段
+     * 设计理念：为支持B样条轨迹表示，需要将每个激光雷达扫描时间段细分
+     */
     void AddNewTimeStep(deque<deque<TimeSegment>> &timeStepDeque, slict::FeatureCloud::ConstPtr &packet)
     {
-        // Add new sequence of sub time step
-        timeStepDeque.push_back(deque<TimeSegment>());
+        // ========== 步骤1: 添加新的时间子段序列容器 ==========
+        timeStepDeque.push_back(deque<TimeSegment>()); // 为新的时间步骤创建子段容器
 
-        // Calculate the sub time steps
+        // ========== 步骤2: 计算时间段参数 ==========
         double start_time, final_time, sub_timestep;
+        
+        // 根据队列中的时间步骤数量决定时间计算方式
         if (timeStepDeque.size() == 1)
         {
-            start_time = packet->scanStartTime;
-            final_time = packet->scanEndTime;
-            sub_timestep = (final_time - start_time)/N_SUB_SEG;
+            // 情况1：第一个时间步骤 - 直接使用数据包中的扫描时间
+            start_time = packet->scanStartTime;  // 使用扫描开始时间
+            final_time = packet->scanEndTime;    // 使用扫描结束时间
+            sub_timestep = (final_time - start_time)/N_SUB_SEG; // 计算子时间段长度
         }
         else
         {
-            start_time = timeStepDeque.rbegin()[1].back().final_time;
-            final_time = packet->scanEndTime;
-            sub_timestep = (final_time - start_time)/N_SUB_SEG;
+            // 情况2：后续时间步骤 - 从前一个时间步骤的结束时间开始
+            start_time = timeStepDeque.rbegin()[1].back().final_time; // 获取前一个时间步骤最后子段的结束时间
+            final_time = packet->scanEndTime;                         // 使用当前扫描的结束时间
+            sub_timestep = (final_time - start_time)/N_SUB_SEG;       // 计算子时间段长度
         }
 
+        // ========== 步骤3: 创建时间子段序列 ==========
+        // 将整个时间段均匀分割为N_SUB_SEG个子段，支持B样条的分段表示
         for(int i = 0; i < N_SUB_SEG; i++)
-            timeStepDeque.back().push_back(TimeSegment(start_time + i*sub_timestep,
-                                                       start_time + (i+1)*sub_timestep));
-    }
+            timeStepDeque.back().push_back(TimeSegment(start_time + i*sub_timestep,      // 子段开始时间
+                                                       start_time + (i+1)*sub_timestep)); // 子段结束时间
+    } // AddNewTimeStep() 函数结束
 
+    /**
+     * 将IMU数据添加到缓冲区函数
+     * 功能描述：从数据包中提取IMU数据，进行时间同步和插值处理，然后分配到对应的时间子段中
+     * @param timeStepDeque 时间步骤双端队列，定义了时间分段结构
+     * @param imuBundleDeque IMU数据束双端队列，存储每个时间步骤的IMU子序列
+     * @param packet 输入的特征点云数据包，包含IMU测量数据
+     * @param regularize_imu 是否对IMU数据进行规范化处理的标志
+     * 主要步骤：
+     *   1. 扩展IMU缓冲区结构
+     *   2. 提取和规范化IMU数据
+     *   3. 处理时间连续性（边界条件）
+     *   4. 分配IMU数据到各个时间子段并进行参数化
+     */
     void AddImuToBuff(deque<deque<TimeSegment>> &timeStepDeque, deque<deque<ImuSequence>> &imuBundleDeque,
                       slict::FeatureCloud::ConstPtr &packet, bool regularize_imu)
     {
-        // Extend the imu deque
+        // ========== 步骤1: 扩展IMU双端队列结构 ==========
+        // 为新的时间步骤创建N_SUB_SEG个IMU子序列容器
         imuBundleDeque.push_back(deque<ImuSequence>(N_SUB_SEG));
 
-        // Extract and regularize imu data at on the latest buffer
-        ImuSequence newImuSequence;
-        ExtractImuData(newImuSequence, packet, regularize_imu); // Only select the primary IMU at this stage
+        // ========== 步骤2: 提取和规范化IMU数据 ==========
+        ImuSequence newImuSequence;  // 新的IMU序列容器
+        // 从数据包中提取IMU数据，此阶段只选择主要的IMU数据
+        ExtractImuData(newImuSequence, packet, regularize_imu);
 
-        // Extract subsequence of imu sample data, interpolate at sub steps
+        // ========== 步骤3: 处理时间连续性 ==========
+        // 为确保IMU数据在时间边界处的连续性，需要添加边界样本
         if(timeStepDeque.size() == 1)
         {
-            // Duplicate the first sample for continuity
-            newImuSequence.push_front(newImuSequence.front());
+            // 情况1：第一个时间步骤 - 复制第一个样本以保证连续性
+            newImuSequence.push_front(newImuSequence.front());  // 复制首个IMU样本
+            // 将复制的样本时间戳设置为时间段的开始时间
             newImuSequence.front().t = timeStepDeque.front().front().start_time;
         }
         else
-            // Borrow the last sample time in the previous interval for continuity
+            // 情况2：后续时间步骤 - 借用前一个时间间隔的最后一个样本来保证连续性
             newImuSequence.push_front(imuBundleDeque.rbegin()[1].back().back());
 
-        // Extract the samples in each sub interval          
+        // ========== 步骤4: 将IMU数据分配到各个时间子段 ==========
+        // 遍历当前时间步骤的所有子段
         for(int i = 0; i < timeStepDeque.back().size(); i++)
         {
-            double start_time = timeStepDeque.back()[i].start_time;
-            double final_time = timeStepDeque.back()[i].final_time;
-            double dt = final_time - start_time;
+            // 获取当前子段的时间边界
+            double start_time = timeStepDeque.back()[i].start_time;  // 子段开始时间
+            double final_time = timeStepDeque.back()[i].final_time;  // 子段结束时间
+            double dt = final_time - start_time;                     // 子段时间长度
             
+            // 从IMU序列中提取当前时间子段内的数据
             imuBundleDeque.back()[i] = newImuSequence.subsequence(start_time, final_time);
+            
+            // 对当前子段中的每个IMU样本进行参数化处理
             for(int j = 0; j < imuBundleDeque.back()[i].size(); j++)
             {
-                imuBundleDeque.back()[i][j].u = start_time;
+                imuBundleDeque.back()[i][j].u = start_time;  // u参数：子段开始时间（用于B样条基础）
+                // s参数：归一化时间参数 [0,1]，表示在当前子段内的相对位置
                 imuBundleDeque.back()[i][j].s = (imuBundleDeque.back()[i][j].t - start_time)/dt;
             }
         }
-    }
+    } // AddImuToBuff() 函数结束
 
     void ExtractImuData(ImuSequence &imu_sequence, slict::FeatureCloud::ConstPtr &packet, bool regularize_timestamp)
     {
@@ -2663,94 +2799,139 @@ public:
         tt_fitspline.Toc();    
     }
     
+    /**
+     * 激光雷达-惯导联合优化函数
+     * 功能描述：执行SLAM系统的核心优化过程，融合IMU和激光雷达数据约束，估计B样条轨迹和传感器偏差
+     * @param report 输出优化统计报告，包含各类因子数量、代价函数值、迭代次数等信息
+     * @param lioop_times_report 输出详细的时间分析报告字符串
+     * @param traj B样条轨迹对象，包含待优化的位姿节点参数
+     * @param prev_knot_x 前一次优化的节点索引映射
+     * @param curr_knot_x 当前优化的节点索引映射
+     * @param swNextBase 滑动窗口下一个基准索引
+     * @param iter 当前优化迭代次数
+     * @param imuSelected 选中的IMU因子索引列表
+     * @param featureSelected 选中的激光雷达特征因子索引列表
+     * @param tlog 时间日志对象，记录各阶段计算时间
+     * 
+     * 优化策略：
+     *   1. 优先尝试自定义求解器（更快速）
+     *   2. 如果失败，回退到Ceres优化器（更稳健）
+     *   3. 多种因子类型：IMU、激光雷达、位姿传播、速度约束
+     *   4. 时间预算管理，确保实时性能
+     */
     void LIOOptimization(slict::OptStat &report, string &lioop_times_report, PoseSplineX &traj,
                          map<int, int> &prev_knot_x, map<int, int> &curr_knot_x, int swNextBase, int iter,
                          vector<ImuIdx> &imuSelected,vector<lidarFeaIdx> &featureSelected, slict::TimeLog &tlog)
     {
+        // ========== 步骤1: 创建IMU偏差状态 ==========
+        // 从滑动窗口最后一帧的最后一个时间段提取陀螺仪和加速度计偏差
+        Vector3d XBIG(sfBig.back().back());  // 陀螺仪偏差（Gyroscope Bias）
+        Vector3d XBIA(sfBia.back().back());  // 加速度计偏差（Accelerometer Bias）
 
-        // Create the states for the bias
-        Vector3d XBIG(sfBig.back().back());
-        Vector3d XBIA(sfBia.back().back());
-
-        // Create a custom solver
+        // ========== 步骤2: 自定义求解器尝试 ==========
+        // 创建自定义TMN求解器（仅在首次调用时初始化）
         if(mySolver == NULL)
             mySolver = new tmnSolver(nh_ptr);
 
-        string iekf_report = "";
-        bool ms_success = false;
+        string iekf_report = "";  // 迭代扩展卡尔曼滤波器报告
+        bool ms_success = false;  // 自定义求解器成功标志
 
-        // Solve the least square problem
+        // 尝试使用自定义最小二乘求解器（更快速的解决方案）
         if (!use_ceres)
             ms_success = mySolver->Solve(traj, XBIG, XBIA, prev_knot_x, curr_knot_x, swNextBase, iter,
                                           SwImuBundle, SwCloudDskDS, SwLidarCoef,
                                           imuSelected, featureSelected, iekf_report, report, tlog);
 
+        // ========== 步骤3: 自定义求解器成功后的参数载入 ==========
         if (ms_success)
         {
+            /**
+             * 参数载入器内部结构体
+             * 功能：将B样条轨迹参数转换为状态变量（位姿、速度、偏差）
+             */
             struct Loader
             {
+                /**
+                 * 从B样条轨迹参数复制到状态变量
+                 * @param t 时间戳
+                 * @param traj B样条轨迹对象
+                 * @param ba 加速度计偏差数组指针
+                 * @param bg 陀螺仪偏差数组指针
+                 * @param BAMAX 加速度计偏差最大值限制
+                 * @param BGMAX 陀螺仪偏差最大值限制
+                 * @param p_ 输出位置向量
+                 * @param q_ 输出旋转四元数
+                 * @param v_ 输出速度向量
+                 * @param ba_ 输出加速度计偏差向量
+                 * @param bg_ 输出陀螺仪偏差向量
+                 */
                 void CopyParamToState(double t, PoseSplineX &traj, double *ba, double *bg, Vector3d &BAMAX, Vector3d &BGMAX,
                                       Vector3d &p_, Quaternd &q_, Vector3d &v_, Vector3d &ba_, Vector3d &bg_)
                 {
-
+                    // 时间边界检查和修正，确保时间在轨迹有效范围内
                     if (t < traj.minTime() + 1e-06)
                     {
                         // printf("State time is earlier than SW time: %f < %f\n", t, traj.minTime());
-                        t = traj.minTime() + 1e-06;
+                        t = traj.minTime() + 1e-06;  // 调整到最小时间边界
                     }
 
                     if (t > traj.maxTime() - 1e-06)
                     {
                         // printf("State time is later than SW time: %f > %f\n", t, traj.maxTime());
-                        t = traj.maxTime() - 1e-06;
+                        t = traj.maxTime() - 1e-06;  // 调整到最大时间边界
                     }
 
+                    // 从B样条轨迹获取指定时间的位姿
                     SE3d pose = traj.pose(t);
 
-                    p_ = pose.translation();
-                    q_ = pose.so3().unit_quaternion();
+                    // 提取位置和旋转
+                    p_ = pose.translation();                    // 3D位置
+                    q_ = pose.so3().unit_quaternion();         // 单位四元数旋转
 
+                    // 获取世界坐标系下的平移速度
                     v_ = traj.transVelWorld(t);
 
+                    // 加速度计偏差边界约束处理
                     for (int i = 0; i < 3; i++)
                     {
                         if (fabs(ba[i]) > BAMAX[i])
                         {
-                            ba_(i) = ba[i]/fabs(ba[i])*BAMAX[i];
+                            ba_(i) = ba[i]/fabs(ba[i])*BAMAX[i];  // 超出边界时，保持符号但限制幅值
                             break;
                         }
                         else
-                            ba_(i) = ba[i];
+                            ba_(i) = ba[i];  // 直接赋值
                     }
 
+                    // 陀螺仪偏差边界约束处理
                     for (int i = 0; i < 3; i++)
                     {
                         if (fabs(bg[i]) > BGMAX[i])
                         {
-                            bg_(i) = bg[i]/fabs(bg[i])*BGMAX[i];
+                            bg_(i) = bg[i]/fabs(bg[i])*BGMAX[i];  // 超出边界时，保持符号但限制幅值
                             break;
                         }
                         else
-                            bg_(i) = bg[i];
+                            bg_(i) = bg[i];  // 直接赋值
                     }
 
                     // printf("Bg: %f, %f, %f -> %f, %f, %f\n", bg[0], bg[1], bg[2], bg_.x(), bg_.y(), bg_.z());
                     // printf("Ba: %f, %f, %f -> %f, %f, %f\n", ba[0], ba[1], ba[2], ba_.x(), ba_.y(), ba_.z());
                 }
 
-            } loader;
+            } loader;  // 创建载入器实例
 
-            // Load values from params to state
-            for(int i = 0; i < WINDOW_SIZE; i++)
+            // 从优化后的B样条轨迹参数载入到滑动窗口状态变量
+            for(int i = 0; i < WINDOW_SIZE; i++)           // 遍历滑动窗口中的每一帧
             {
-                for(int j = 0; j < SwTimeStep[i].size(); j++)
+                for(int j = 0; j < SwTimeStep[i].size(); j++)  // 遍历每帧中的每个时间段
                 {
-                    // Load the state at the start time of each segment
+                    // 载入时间段起始时刻的状态
                     double ss_time = SwTimeStep[i][j].start_time;
                     loader.CopyParamToState(ss_time, traj, XBIA.data(), XBIG.data(), BA_BOUND, BG_BOUND,
                                             ssPos[i][j], ssQua[i][j], ssVel[i][j], ssBia[i][j], ssBig[i][j]);    
 
-                    // Load the state at the final time of each segment
+                    // 载入时间段结束时刻的状态
                     double sf_time = SwTimeStep[i][j].final_time;
                     loader.CopyParamToState(sf_time, traj, XBIA.data(), XBIG.data(), BA_BOUND, BG_BOUND,
                                             sfPos[i][j], sfQua[i][j], sfVel[i][j], sfBia[i][j], sfBig[i][j]);
@@ -2758,224 +2939,271 @@ public:
                     // printf("Vel %f: %.2f, %.2f, %.2f\n", sf_time, sfVel[i][j].x(), sfVel[i][j].y(), sfVel[i][j].z());
                 }
             }
-        }
+        } // 自定义求解器成功分支结束
 
-        if(!ms_success)
+        // ========== 步骤4: Ceres优化器回退方案 ==========
+        if(!ms_success)  // 如果自定义求解器失败，使用Ceres优化器
         {
-/* #region */ TicToc tt_buildceres;
+/* #region */ TicToc tt_buildceres;  // 开始计时：Ceres问题构建
 
-/* #region */ TicToc tt_create;
+/* #region */ TicToc tt_create;      // 开始计时：创建问题和设置选项
 
-            // Create and solve the Ceres Problem
-            ceres::Problem problem;
-            ceres::Solver::Options options;
+            // 创建并配置Ceres优化问题
+            ceres::Problem problem;                // Ceres非线性优化问题对象
+            ceres::Solver::Options options;       // 求解器选项配置
 
-            // Set up the options
-            options.minimizer_type                    = ceres::TRUST_REGION;
-            options.linear_solver_type                = linSolver;
-            options.trust_region_strategy_type        = trustRegType;
-            options.dense_linear_algebra_library_type = linAlgbLib;
-            options.max_num_iterations                = max_iterations;
-            options.max_solver_time_in_seconds        = max_solve_time;
-            options.num_threads                       = MAX_THREADS;
-            options.minimizer_progress_to_stdout      = false;
-            options.use_nonmonotonic_steps            = true;
+            // ========== 4.1: 配置求解器选项 ==========
+            options.minimizer_type                    = ceres::TRUST_REGION;    // 信赖域方法
+            options.linear_solver_type                = linSolver;              // 线性求解器类型
+            options.trust_region_strategy_type        = trustRegType;           // 信赖域策略
+            options.dense_linear_algebra_library_type = linAlgbLib;             // 稠密线性代数库
+            options.max_num_iterations                = max_iterations;         // 最大迭代次数
+            options.max_solver_time_in_seconds        = max_solve_time;         // 最大求解时间
+            options.num_threads                       = MAX_THREADS;            // 并行线程数
+            options.minimizer_progress_to_stdout      = false;                  // 不显示优化进度
+            options.use_nonmonotonic_steps            = true;                   // 允许非单调步骤
 
+            // 创建SO(3)李群局部参数化器（处理旋转约束）
             ceres::LocalParameterization *local_parameterization = new LieAnalyticLocalParameterization<SO3d>();
 
-            // Number of knots of the spline
-            int KNOTS = traj.numKnots();
+            // ========== 4.2: 获取B样条节点数量 ==========
+            int KNOTS = traj.numKnots();  // B样条轨迹的节点总数
 
-            // Add the parameter blocks for rotational knots
+            // ========== 4.3: 添加旋转参数块 ==========
+            // 为B样条轨迹的每个旋转节点添加参数块（4维四元数，使用李群参数化）
             for (int knot_idx = 0; knot_idx < KNOTS; knot_idx++)
                 problem.AddParameterBlock(traj.getKnotSO3(knot_idx).data(), 4, local_parameterization);
 
-            // Add the parameter blocks for positional knots
+            // ========== 4.4: 添加位置参数块 ==========
+            // 为B样条轨迹的每个位置节点添加参数块（3维欧几里得空间）
             for (int knot_idx = 0; knot_idx < KNOTS; knot_idx++)
                 problem.AddParameterBlock(traj.getKnotPos(knot_idx).data(), 3);
 
-            // Add the parameters for imu biases
-            double *BIAS_G = XBIG.data();
-            double *BIAS_A = XBIA.data();
+            // ========== 4.5: 添加IMU偏差参数块 ==========
+            double *BIAS_G = XBIG.data();  // 陀螺仪偏差参数指针
+            double *BIAS_A = XBIA.data();  // 加速度计偏差参数指针
 
             // BIAS_G[0] = sfBig.back().back().x(); BIAS_A[0] = sfBia.back().back().x();
             // BIAS_G[1] = sfBig.back().back().y(); BIAS_A[1] = sfBia.back().back().y();
             // BIAS_G[2] = sfBig.back().back().z(); BIAS_A[2] = sfBia.back().back().z();
 
-            problem.AddParameterBlock(BIAS_G, 3);
-            problem.AddParameterBlock(BIAS_A, 3);
+            problem.AddParameterBlock(BIAS_G, 3);  // 3维陀螺仪偏差
+            problem.AddParameterBlock(BIAS_A, 3);  // 3维加速度计偏差
 
+            // ========== 4.6: IMU偏差边界约束（已禁用）==========
             // for(int i = 0; i < 3; i++)
             // {
             //     if(BG_BOUND[i] > 0)
             //     {
-            //         problem.SetParameterLowerBound(BIAS_G, i, -BG_BOUND[i]);
-            //         problem.SetParameterUpperBound(BIAS_G, i,  BG_BOUND[i]);
+            //         problem.SetParameterLowerBound(BIAS_G, i, -BG_BOUND[i]);  // 陀螺仪偏差下界
+            //         problem.SetParameterUpperBound(BIAS_G, i,  BG_BOUND[i]);  // 陀螺仪偏差上界
             //     }
 
             //     if(BA_BOUND[i] > 0)
             //     {
-            //         problem.SetParameterLowerBound(BIAS_A, i, -BA_BOUND[i]);
-            //         problem.SetParameterUpperBound(BIAS_A, i,  BA_BOUND[i]);
+            //         problem.SetParameterLowerBound(BIAS_A, i, -BA_BOUND[i]);  // 加速度计偏差下界
+            //         problem.SetParameterUpperBound(BIAS_A, i,  BA_BOUND[i]);  // 加速度计偏差上界
             //     }
             // }
 
-            // Fix the fist and the last N knots
-            first_fixed_knot = -1;
-            last_fixed_knot = -1;
+            // ========== 4.7: 固定滑动窗口起始节点 ==========
+            // 固定前几个和后几个节点以提供观测约束和数值稳定性
+            first_fixed_knot = -1;  // 第一个固定节点索引
+            last_fixed_knot = -1;   // 最后一个固定节点索引
+            
             for (int knot_idx = 0; knot_idx < KNOTS; knot_idx++)
             {
                 if (
-                    traj.getKnotTime(knot_idx) <= traj.minTime() + start_fix_span
-                    // || traj.getKnotTime(knot_idx) > traj.getKnotTime(KNOTS-1) - final_fix_span
+                    traj.getKnotTime(knot_idx) <= traj.minTime() + start_fix_span  // 在起始固定时间范围内
+                    // || traj.getKnotTime(knot_idx) > traj.getKnotTime(KNOTS-1) - final_fix_span  // 在结束固定时间范围内（已禁用）
                 )
                 {
                     if(first_fixed_knot == -1)
-                        first_fixed_knot = knot_idx;
+                        first_fixed_knot = knot_idx;  // 记录第一个固定节点
 
-                    last_fixed_knot = knot_idx;
+                    last_fixed_knot = knot_idx;       // 更新最后一个固定节点
+                    
+                    // 固定该节点的旋转和位置参数（设为常量，不参与优化）
                     problem.SetParameterBlockConstant(traj.getKnotSO3(knot_idx).data());
                     problem.SetParameterBlockConstant(traj.getKnotPos(knot_idx).data());
                 }
             }
 
-/* #endregion */ tt_create.Toc();
+/* #endregion */ tt_create.Toc();  // 结束计时：问题创建
 
-/* #region */ TicToc tt_addlidar;
+/* #region */ TicToc tt_addlidar;    // 开始计时：添加激光雷达因子
 
-            // Cloud to show points being associated
+            // ========== 4.8: 添加激光雷达约束因子 ==========
+            // 用于可视化关联点云的容器
             CloudXYZIPtr assocCloud(new CloudXYZI());
 
-            // Add the lidar factors
-            vector<ceres::internal::ResidualBlock *> res_ids_surf;
-            double cost_surf_init = -1, cost_surf_final = -1;
-            if(fuse_lidar)
+            // 激光雷达因子相关变量
+            vector<ceres::internal::ResidualBlock *> res_ids_surf;  // 表面因子残差块ID列表
+            double cost_surf_init = -1, cost_surf_final = -1;       // 初始和最终表面代价函数值
+            
+            if(fuse_lidar)  // 如果启用激光雷达融合
             {
-                // Shared loss function
+                // 创建鲁棒损失函数（Cauchy损失或无损失函数）
                 ceres::LossFunction *lidar_loss_function = lidar_loss_thres == -1 ? NULL : new ceres::CauchyLoss(lidar_loss_thres);
-                int factor_idx = 0;
+                int factor_idx = 0;  // 因子索引计数器
 
-                // Find and mark the used factors
-                // for (int i = 0; i < WINDOW_SIZE; i++)
+                // 遍历选中的激光雷达特征因子并添加到优化问题
+                // for (int i = 0; i < WINDOW_SIZE; i++)    // 原始双重循环（已注释）
                 // {
-                // #pragma omp parallel for num_threads(MAX_THREADS)
-                for (int j = 0; j < featureSelected.size(); j++)
+                // #pragma omp parallel for num_threads(MAX_THREADS)  // 并行处理（已注释）
+                
+                for (int j = 0; j < featureSelected.size(); j++)  // 遍历选中的特征因子
                 {   
-                    int  i = featureSelected[j].wdidx;
-                    int  k = featureSelected[j].pointidx;
-                    int  depth = featureSelected[j].depth;
+                    // 提取特征因子的索引信息
+                    int  i = featureSelected[j].wdidx;      // 滑动窗口索引
+                    int  k = featureSelected[j].pointidx;   // 点云中的点索引
+                    int  depth = featureSelected[j].depth;  // 关联深度信息
 
-                    auto &point = SwCloudDskDS[i]->points[k];
-                    int  point_idx = (int)(point.intensity);
-                    int  coeff_idx = k;
+                    auto &point = SwCloudDskDS[i]->points[k];  // 获取对应的点云点
+                    int  point_idx = (int)(point.intensity);   // 原始点云中的索引
+                    int  coeff_idx = k;                        // 约束系数索引
 
-                    const LidarCoef &coef = SwLidarCoef[i][coeff_idx];
+                    const LidarCoef &coef = SwLidarCoef[i][coeff_idx];  // 获取激光雷达约束系数
                     // ROS_ASSERT_MSG(coef.t >= 0, "i = %d, k = %d, t = %f", i, k, coef.t);
-                    double sample_time = coef.t;
+                    double sample_time = coef.t;  // 样本时间戳
                     // ROS_ASSERT(traj.TimeIsValid(sample_time, 1e-6));
+                    
+                    // 计算B样条参数：u为归一化时间，s为基节点索引
                     auto   us = traj.computeTIndex(sample_time);
-                    double u  = us.first;
-                    int    s  = us.second;
-                    int base_knot = s;
-                    vector<double*> factor_param_blocks;
-                    // Add the parameter blocks for rotation
+                    double u  = us.first;   // 归一化时间参数 [0,1]
+                    int    s  = us.second;  // 基节点索引
+                    int base_knot = s;  // 基节点索引
+                    vector<double*> factor_param_blocks;  // 因子参数块列表
+                    
+                    // 添加旋转参数块：涉及SPLINE_N个连续节点的旋转参数
                     for (int knot_idx = base_knot; knot_idx < base_knot + SPLINE_N; knot_idx++)
                         factor_param_blocks.push_back(traj.getKnotSO3(knot_idx).data());
-                    // Add the parameter blocks for position
+                    
+                    // 添加位置参数块：涉及SPLINE_N个连续节点的位置参数
                     for (int knot_idx = base_knot; knot_idx < base_knot + SPLINE_N; knot_idx++)
                         factor_param_blocks.push_back(traj.getKnotPos(knot_idx).data());
-                    // Shared associate settings
-                    factor_idx++;
+                    
+                    // 配置关联设置（用于地图关联和重关联）
+                    factor_idx++;  // 因子计数递增
                     assocSettings settings(use_ufm, reassoc_rate > 0, reassoc_rate,
                                            surfel_min_point, surfel_min_plnrty, surfel_intsect_rad, dis_to_surfel_max,
                                            lidar_weight, i*100000 + factor_idx);
-                    // Add the residual
+                    
+                    // 创建并添加点到平面解析因子
                     typedef PointToPlaneAnalyticFactor<PredType> p2pFactor;
                     auto res = problem.AddResidualBlock(
-                                new p2pFactor(coef.finW, coef.f, coef.n, coef.plnrty*lidar_weight,
-                                              SPLINE_N, traj.getDt(), u, activeSurfelMap, *commonPred, activeikdtMap, settings),
-                                              lidar_loss_function, factor_param_blocks);
-                    res_ids_surf.push_back(res);    
-                    // Add point to visualization
-                    PointXYZI pointInW; pointInW.x = coef.finW.x(); pointInW.y = coef.finW.y(); pointInW.z = coef.finW.z();
+                                new p2pFactor(coef.finW,           // 世界坐标系中的点位置
+                                              coef.f,              // 到平面的距离
+                                              coef.n,              // 平面法向量
+                                              coef.plnrty*lidar_weight,  // 平面性加权权重
+                                              SPLINE_N, traj.getDt(), u,  // B样条参数
+                                              activeSurfelMap, *commonPred, activeikdtMap, settings),  // 地图和关联设置
+                                              lidar_loss_function,   // 损失函数
+                                              factor_param_blocks);  // 参数块列表
+                    res_ids_surf.push_back(res);  // 保存残差块ID用于代价计算
+                    
+                    // 添加点到可视化点云（用于调试和可视化）
+                    PointXYZI pointInW; 
+                    pointInW.x = coef.finW.x(); 
+                    pointInW.y = coef.finW.y(); 
+                    pointInW.z = coef.finW.z();
                     assocCloud->push_back(pointInW);
-                    assocCloud->points.back().intensity = i;
+                    assocCloud->points.back().intensity = i;  // 用强度标记所属窗口索引
                 }
                 // }
             }
 
-/* #endregion */ tt_addlidar.Toc();
+/* #endregion */ tt_addlidar.Toc();  // 结束计时：激光雷达因子添加
         
-/* #region */ TicToc tt_addimu;
+/* #region */ TicToc tt_addimu;       // 开始计时：IMU因子添加
 
-            // Create and add the new preintegration factors
-            vector<ceres::internal::ResidualBlock *> res_ids_pimu;
-            double cost_pimu_init = -1, cost_pimu_final = -1;
-            // deque<deque<PreintBase *>> local_preints(WINDOW_SIZE, deque<PreintBase *>(N_SUB_SEG));
-            if(fuse_imu)
+            // ========== 4.9: 添加IMU惯性测量约束因子 ==========
+            // 创建并添加新的预积分因子
+            vector<ceres::internal::ResidualBlock *> res_ids_pimu;  // IMU因子残差块ID列表
+            double cost_pimu_init = -1, cost_pimu_final = -1;       // 初始和最终IMU代价函数值
+            // deque<deque<PreintBase *>> local_preints(WINDOW_SIZE, deque<PreintBase *>(N_SUB_SEG));  // 局部预积分（已注释）
+            
+            if(fuse_imu)  // 如果启用IMU融合
             {
+                // 创建IMU鲁棒损失函数
                 ceres::LossFunction* loss_function = imu_loss_thres < 0 ? NULL : new ceres::CauchyLoss(imu_loss_thres);
 
-                for(int i = 0; i < WINDOW_SIZE; i++)
+                // 三层循环遍历滑动窗口中的所有IMU数据
+                for(int i = 0; i < WINDOW_SIZE; i++)        // 遍历滑动窗口中的每一帧
                 {
-                    for(int j = 0; j < N_SUB_SEG; j++)
+                    for(int j = 0; j < N_SUB_SEG; j++)      // 遍历每帧中的每个时间子段
                     {
-                        for(int k = 1; k < SwImuBundle[i][j].size(); k++)
+                        for(int k = 1; k < SwImuBundle[i][j].size(); k++)  // 遍历每个子段中的IMU样本（跳过第0个）
                         {
-                            double sample_time = SwImuBundle[i][j][k].t;
+                            double sample_time = SwImuBundle[i][j][k].t;  // 获取IMU样本时间戳
                             
-                            // Skip if sample time exceeds the bound
+                            // 检查样本时间是否超出轨迹有效范围
                             if (!traj.TimeIsValid(sample_time, 1e-6))
-                                continue;
+                                continue;  // 超出范围则跳过
 
-                            auto imuBias = ImuBias(Vector3d(BIAS_G[0], BIAS_G[1], BIAS_G[2]),
-                                                Vector3d(BIAS_A[0], BIAS_A[1], BIAS_A[2]));
+                            // 创建IMU偏差对象（包含陀螺仪和加速度计偏差）
+                            auto imuBias = ImuBias(Vector3d(BIAS_G[0], BIAS_G[1], BIAS_G[2]),  // 陀螺仪偏差
+                                                Vector3d(BIAS_A[0], BIAS_A[1], BIAS_A[2]));   // 加速度计偏差
         
+                            // 计算B样条时间索引
                             auto   us = traj.computeTIndex(sample_time);
-                            double u  = us.first;
-                            int    s  = us.second;
+                            double u  = us.first;   // 归一化时间参数
+                            int    s  = us.second;  // 基节点索引
 
-                            double gyro_weight = GYR_N;
-                            double acce_weight = ACC_N;
-                            double bgyr_weight = GYR_W;
-                            double bacc_weight = ACC_W;
+                            // 设置IMU观测权重（来自噪声协方差）
+                            double gyro_weight = GYR_N;  // 陀螺仪观测噪声权重
+                            double acce_weight = ACC_N;  // 加速度计观测噪声权重
+                            double bgyr_weight = GYR_W;  // 陀螺仪偏差随机游走权重
+                            double bacc_weight = ACC_W;  // 加速度计偏差随机游走权重
 
+                            // 创建陀螺仪-加速度计-偏差解析因子
                             ceres::CostFunction *cost_function =
                                 new GyroAcceBiasAnalyticFactor
-                                    (SwImuBundle[i][j][k], imuBias, GRAV, gyro_weight, acce_weight, bgyr_weight, bacc_weight, SPLINE_N, traj.getDt(), u);
+                                    (SwImuBundle[i][j][k],    // IMU测量数据
+                                     imuBias,                 // IMU偏差
+                                     GRAV,                    // 重力向量
+                                     gyro_weight, acce_weight, bgyr_weight, bacc_weight,  // 权重参数
+                                     SPLINE_N, traj.getDt(), u);  // B样条参数
 
-                            // Find the coupled poses
+                            // 找到与该IMU样本时间相关联的B样条节点参数
                             vector<double *> factor_param_blocks;
+                            
+                            // 添加旋转参数块：涉及SPLINE_N个连续节点
                             for (int knot_idx = s; knot_idx < s + SPLINE_N; knot_idx++)
                                 factor_param_blocks.emplace_back(traj.getKnotSO3(knot_idx).data());
 
+                            // 添加位置参数块：涉及SPLINE_N个连续节点
                             for (int knot_idx = s; knot_idx < s + SPLINE_N; knot_idx++)
                                 factor_param_blocks.emplace_back(traj.getKnotPos(knot_idx).data());
 
-                            // gyro bias
+                            // 添加陀螺仪偏差参数块
                             factor_param_blocks.emplace_back(BIAS_G);
 
-                            // acce bias
+                            // 添加加速度计偏差参数块
                             factor_param_blocks.emplace_back(BIAS_A);
 
-                            // cost_function->SetNumResiduals(12);
+                            // cost_function->SetNumResiduals(12);  // 残差维度：3(gyro) + 3(acce) + 3(gyro_bias) + 3(acce_bias) = 12
+                            
+                            // 添加IMU残差块到优化问题
                             auto res_block = problem.AddResidualBlock(cost_function, loss_function, factor_param_blocks);
-                            res_ids_pimu.push_back(res_block);    
+                            res_ids_pimu.push_back(res_block);  // 保存残差块ID用于代价计算    
                         }
                     }
                 }
             }
 
-/* #endregion */ tt_addimu.Toc();
+/* #endregion */ tt_addimu.Toc();     // 结束计时：IMU因子添加
 
-/* #region */ TicToc tt_addpp;
+/* #region */ TicToc tt_addpp;         // 开始计时：位姿传播因子添加
 
-            vector<ceres::internal::ResidualBlock *> res_ids_poseprop;
-            double cost_poseprop_init = -1, cost_poseprop_final = -1;
-            if(fuse_poseprop)
+            // ========== 4.10: 添加位姿传播约束因子 ==========
+            vector<ceres::internal::ResidualBlock *> res_ids_poseprop;  // 位姿传播因子残差块ID列表
+            double cost_poseprop_init = -1, cost_poseprop_final = -1;   // 初始和最终位姿传播代价值
+            
+            if(fuse_poseprop)  // 如果启用位姿传播融合
             {
-                // Add the poses
-                for(int i = 0; i < WINDOW_SIZE - 1 - reassociate_steps; i++)
+                // 添加位姿传播约束（来自IMU预积分或其他odometry）
+                for(int i = 0; i < WINDOW_SIZE - 1 - reassociate_steps; i++)  // 避免重关联步骤的干扰
                 {
                     for(int j = 0; j < SwPropState[i].size(); j++)
                     {
@@ -3050,53 +3278,59 @@ public:
                 }
             }
 
-/* #endregion */ tt_addpp.Toc();
+/* #endregion */ tt_addpp.Toc();    // 结束计时：位姿传播因子添加
             
-/* #region */ TicToc tt_init_cost;
+/* #region */ TicToc tt_init_cost;   // 开始计时：初始代价计算
 
-            if(find_factor_cost)
+            // ========== 4.12: 计算优化前的初始代价函数值 ==========
+            if(find_factor_cost)  // 如果需要计算因子代价（用于分析和调试）
             {
-                Util::ComputeCeresCost(res_ids_surf, cost_surf_init, problem);
-                Util::ComputeCeresCost(res_ids_pimu, cost_pimu_init, problem);
-                Util::ComputeCeresCost(res_ids_poseprop, cost_poseprop_init, problem);
-                Util::ComputeCeresCost(res_ids_velprop, cost_velprop_init, problem);
+                Util::ComputeCeresCost(res_ids_surf, cost_surf_init, problem);         // 表面因子代价
+                Util::ComputeCeresCost(res_ids_pimu, cost_pimu_init, problem);         // IMU因子代价
+                Util::ComputeCeresCost(res_ids_poseprop, cost_poseprop_init, problem); // 位姿传播因子代价
+                Util::ComputeCeresCost(res_ids_velprop, cost_velprop_init, problem);   // 速度传播因子代价
             }
 
-/* #endregion */ tt_init_cost.Toc();
+/* #endregion */ tt_init_cost.Toc(); // 结束计时：初始代价计算
             
-/* #endregion */ tt_buildceres.Toc(); tlog.t_prep.push_back(tt_buildceres.GetLastStop());
+/* #endregion */ tt_buildceres.Toc(); tlog.t_prep.push_back(tt_buildceres.GetLastStop()); // 记录预处理时间
 
-/* #region */ TicToc tt_solve;
+/* #region */ TicToc tt_solve;        // 开始计时：优化求解
 
-            if (ensure_real_time)
+            // ========== 4.13: 实时性能预算管理 ==========
+            if (ensure_real_time)  // 如果需要确保实时性能
             {
+                // 动态调整求解时间预算：总预算95% - 已用时间，最少50ms
                 t_slv_budget = max(50.0, sweep_len * 95 - (tt_preopt.GetLastStop() + tt_buildceres.GetLastStop()));
-                if (packet_buf.size() > 0)
+                if (packet_buf.size() > 0)  // 如果有待处理数据包，限制求解时间
                     t_slv_budget = 50.0;
                 options.max_solver_time_in_seconds = t_slv_budget/1000.0;
             }
             else
                 t_slv_budget = options.max_solver_time_in_seconds*1000;
 
-            ceres::Solver::Summary summary;
-            ceres::Solve(options, &problem, &summary);
+            // ========== 4.14: 执行Ceres非线性优化求解 ==========
+            ceres::Solver::Summary summary;       // 求解摘要
+            ceres::Solve(options, &problem, &summary);  // 执行优化求解
 
-/* #endregion */ tt_solve.Toc(); tlog.t_compute.push_back(tt_solve.GetLastStop());
+/* #endregion */ tt_solve.Toc(); tlog.t_compute.push_back(tt_solve.GetLastStop()); // 记录求解时间
 
-/* #region */ TicToc tt_aftsolve;
+/* #region */ TicToc tt_aftsolve;    // 开始计时：优化后处理
 
-/* #region */ TicToc tt_final_cost;
-            if(find_factor_cost)
+/* #region */ TicToc tt_final_cost;  // 开始计时：最终代价计算
+            // ========== 4.15: 计算优化后的最终代价函数值 ==========
+            if(find_factor_cost)  // 如果需要计算因子代价（用于分析优化效果）
             {
-                Util::ComputeCeresCost(res_ids_surf, cost_surf_final, problem);
-                Util::ComputeCeresCost(res_ids_pimu, cost_pimu_final, problem);
-                Util::ComputeCeresCost(res_ids_poseprop, cost_poseprop_final, problem);
-                Util::ComputeCeresCost(res_ids_velprop, cost_velprop_final, problem);
+                Util::ComputeCeresCost(res_ids_surf, cost_surf_final, problem);         // 最终表面因子代价
+                Util::ComputeCeresCost(res_ids_pimu, cost_pimu_final, problem);         // 最终IMU因子代价
+                Util::ComputeCeresCost(res_ids_poseprop, cost_poseprop_final, problem); // 最终位姿传播因子代价
+                Util::ComputeCeresCost(res_ids_velprop, cost_velprop_final, problem);   // 最终速度传播因子代价
             }
-/* #endregion */ tt_final_cost.Toc();
+/* #endregion */ tt_final_cost.Toc(); // 结束计时：最终代价计算
 
-/* #region  */ TicToc tt_load;
+/* #region  */ TicToc tt_load;        // 开始计时：参数载入状态
 
+            // ========== 4.16: 从优化后的参数载入到状态变量 ==========
             struct Loader
             {
                 // void CopyStateToParam(Vector3d &p_, Quaternd &q_, Vector3d &v_,
@@ -3112,6 +3346,10 @@ public:
                 //     bias[3] = bg.x(); bias[4] = bg.y(); bias[5] = bg.z();
                 // }
 
+                /**
+                 * 从优化后的B样条轨迹参数复制到状态变量（Ceres版本）
+                 * 与自定义求解器版本基本相同，但偏差处理略有不同
+                 */
                 void CopyParamToState(double t, PoseSplineX &traj, double *&ba, double *&bg, Vector3d &BAMAX, Vector3d &BGMAX,
                                     Vector3d &p_, Quaternd &q_, Vector3d &v_, Vector3d &ba_, Vector3d &bg_)
                 {
@@ -3186,28 +3424,34 @@ public:
 
 /* #endregion */ tt_load.Toc();
             
-/* #region Load data to the report */ TicToc tt_report;
+/* #region Load data to the report */ TicToc tt_report;  // 开始计时：报告数据载入
 
-            tlog.ceres_iter = summary.iterations.size();
+            // ========== 4.17: 填充优化统计报告 ==========
+            tlog.ceres_iter = summary.iterations.size();  // 记录Ceres迭代次数
 
-            report.surfFactors = res_ids_surf.size();
-            report.J0Surf = cost_surf_init;
-            report.JKSurf = cost_surf_final;
+            // 表面/激光雷达因子统计
+            report.surfFactors = res_ids_surf.size();      // 表面因子数量
+            report.J0Surf = cost_surf_init;                // 初始表面代价
+            report.JKSurf = cost_surf_final;               // 最终表面代价
             
-            report.imuFactors = res_ids_pimu.size();
-            report.J0Imu = cost_pimu_init;
-            report.JKImu = cost_pimu_final;
+            // IMU因子统计
+            report.imuFactors = res_ids_pimu.size();       // IMU因子数量
+            report.J0Imu = cost_pimu_init;                 // 初始IMU代价
+            report.JKImu = cost_pimu_final;                // 最终IMU代价
 
-            report.propFactors = res_ids_poseprop.size();
-            report.J0Prop = cost_poseprop_init;
-            report.JKProp = cost_poseprop_final;
+            // 位姿传播因子统计
+            report.propFactors = res_ids_poseprop.size();  // 位姿传播因子数量
+            report.J0Prop = cost_poseprop_init;            // 初始位姿传播代价
+            report.JKProp = cost_poseprop_final;           // 最终位姿传播代价
 
-            report.velFactors = res_ids_velprop.size();
-            report.J0Vel = cost_velprop_init;      //cost_vel_init;
-            report.JKVel = cost_velprop_final;     //cost_vel_final;
+            // 速度因子统计
+            report.velFactors = res_ids_velprop.size();    // 速度因子数量
+            report.J0Vel = cost_velprop_init;              // 初始速度代价
+            report.JKVel = cost_velprop_final;             // 最终速度代价
 
-            report.J0 = summary.initial_cost;
-            report.JK = summary.final_cost;
+            // 总体优化代价统计
+            report.J0 = summary.initial_cost;             // 总初始代价
+            report.JK = summary.final_cost;               // 总最终代价
             
             report.Qest.x = sfQua.back().back().x();
             report.Qest.y = sfQua.back().back().y();
@@ -3299,10 +3543,11 @@ public:
                 lioop_times_report += "aftslv: "  + myprintf("%3.1f, ", tt_aftsolve.GetLastStop());
                 lioop_times_report += "\n";
             }
-        }
+        } // Ceres优化器分支结束
 
-        lioop_times_report += iekf_report;
-    }
+        // ========== 步骤5: 合并报告信息 ==========
+        lioop_times_report += iekf_report;  // 将IEKF报告合并到LIO优化时间报告中
+    } // LIOOptimization() 函数结束
 
     void NominateKeyframe()
     {
@@ -3451,72 +3696,106 @@ public:
         tt_margcloud.Toc();
     }
 
+    /**
+     * 关键帧接收处理函数
+     * 功能描述：接收新的关键帧数据，更新地图并发布相关话题
+     * @param t 关键帧时间戳
+     * @param q 关键帧姿态四元数（旋转）
+     * @param p 关键帧位置向量（平移）
+     * @param cloud 传感器坐标系下的关键帧点云
+     * @param marginalizedCloudInW 世界坐标系下的边际化点云
+     * 主要步骤：
+     *   1. 存储关键帧点云数据（传感器坐标系和世界坐标系）
+     *   2. 记录关键帧位姿信息
+     *   3. 更新全局地图
+     *   4. 发布ROS话题用于可视化和其他节点使用
+     */
     void AdmitKeyframe(double t, Quaternd q, Vector3d p, CloudXYZIPtr &cloud, CloudXYZIPtr &marginalizedCloudInW)
     {
-        tt_ufoupdate.Tic();
+        tt_ufoupdate.Tic(); // 开始计时UFO地图更新时间
 
-        KfCloudinB.push_back(CloudXYZIPtr(new CloudXYZI()));
-        KfCloudinW.push_back(CloudXYZIPtr(new CloudXYZI()));
+        // ========== 步骤1: 创建关键帧点云容器 ==========
+        KfCloudinB.push_back(CloudXYZIPtr(new CloudXYZI())); // 传感器坐标系（Body frame）下的关键帧点云
+        KfCloudinW.push_back(CloudXYZIPtr(new CloudXYZI())); // 世界坐标系（World frame）下的关键帧点云
 
-        *KfCloudinB.back() = *cloud;
+        // ========== 步骤2: 存储和变换点云数据 ==========
+        *KfCloudinB.back() = *cloud; // 复制传感器坐标系下的点云
+        // 将点云从传感器坐标系变换到世界坐标系
         pcl::transformPointCloud(*KfCloudinB.back(), *KfCloudinW.back(), p, q);
 
-        KfCloudPose->push_back(myTf(q, p).Pose6D(t));
-        KfCloudPose->points.back().intensity = KfCloudPose->size()-1;   // Use intensity to store keyframe id
+        // ========== 步骤3: 记录关键帧位姿信息 ==========
+        KfCloudPose->push_back(myTf(q, p).Pose6D(t)); // 添加6D位姿（位置+姿态+时间戳）
+        KfCloudPose->points.back().intensity = KfCloudPose->size()-1; // 使用强度字段存储关键帧ID
 
+        // 调试信息输出（已注释）
         // for(int i = 0; i < KfCloudinB.size(); i++)
         //     printf("KF %d. Size: %d. %d\n",
         //             i, KfCloudinB[i]->size(), KfCloudinW[i]->size());
 
         // printf("Be4 add: GMap: %d.\n", globalMap->size(), KfCloudinW.back()->size());
         
-        // Add keyframe pointcloud to global map
+        // ========== 步骤4: 更新全局地图 ==========
+        // 将关键帧点云添加到全局地图中
         {
-            lock_guard<mutex> lock(global_map_mtx);
-            *globalMap += *KfCloudinW.back();
+            lock_guard<mutex> lock(global_map_mtx); // 使用互斥锁保护全局地图，确保线程安全
+            *globalMap += *KfCloudinW.back();       // 累加当前关键帧的世界坐标系点云到全局地图
         }
 
-        // Add keyframe pointcloud to surfel map
+        // ========== 步骤5: 发送点云到地图处理队列 ==========
+        // 将边际化点云发送到地图队列，用于surfel地图或其他地图结构的更新
         SendCloudToMapQueue(marginalizedCloudInW);
 
-        // Filter global map
+        // ========== 步骤6: 全局地图下采样过滤 ==========
+        // 当关键帧数量大于1且启用地图发布时，对全局地图进行下采样以控制数据量
         if (KfCloudPose->size() > 1 && publish_map)
         {
-            pcl::UniformSampling<PointXYZI> downsampler;
-            downsampler.setRadiusSearch(leaf_size);
-            downsampler.setInputCloud(globalMap);
-            downsampler.filter(*globalMap);
+            pcl::UniformSampling<PointXYZI> downsampler;  // 创建均匀下采样器
+            downsampler.setRadiusSearch(leaf_size);       // 设置下采样半径
+            downsampler.setInputCloud(globalMap);         // 设置输入为全局地图
+            downsampler.filter(*globalMap);               // 执行下采样过滤，减少点云密度
         }
 
+        // ========== 步骤7: 发布ROS话题 ==========
+        // 7.1 发布边际化点云话题
         static ros::Publisher margcloud_pub = nh_ptr->advertise<sensor_msgs::PointCloud2>("/marginalized_cloud", 100);
         Util::publishCloud(margcloud_pub, *marginalizedCloudInW, ros::Time(t), current_ref_frame);
 
+        // 7.2 发布关键帧点云话题，并获取ROS消息用于后续封装
         sensor_msgs::PointCloud2 kfCloudROS
             = Util::publishCloud(kfcloud_pub, *KfCloudinW.back(), ros::Time(t), current_ref_frame);
 
+        // 7.3 发布关键帧位姿点云话题，用于轨迹可视化
         sensor_msgs::PointCloud2 kfPoseCloudROS
             = Util::publishCloud(kfpose_pub, *KfCloudPose, ros::Time(t), current_ref_frame);
         
-        slict::FeatureCloud msg;
-        msg.header.stamp = ros::Time(t);
+        // 7.4 封装并发布标准特征点云消息
+        slict::FeatureCloud msg;  // 创建自定义的特征点云消息
+        msg.header.stamp = ros::Time(t);    // 设置时间戳
+        
+        // 设置位姿信息（位置）
         msg.pose.position.x = p.x();
         msg.pose.position.y = p.y();
         msg.pose.position.z = p.z();
+        
+        // 设置位姿信息（姿态四元数）
         msg.pose.orientation.x = q.x();
         msg.pose.orientation.y = q.y();
         msg.pose.orientation.z = q.z();
-        msg.pose.orientation.w = q.w();        
-        msg.extracted_cloud = kfCloudROS;
-        msg.edge_cloud = kfPoseCloudROS;
-        msg.scanStartTime = t;
-        msg.scanEndTime = t;
-        kfcloud_std_pub.publish(msg);
+        msg.pose.orientation.w = q.w();
+        
+        // 设置点云数据和时间信息        
+        msg.extracted_cloud = kfCloudROS;    // 关键帧点云
+        msg.edge_cloud = kfPoseCloudROS;     // 位姿轨迹点云
+        msg.scanStartTime = t;               // 扫描开始时间
+        msg.scanEndTime = t;                 // 扫描结束时间
+        kfcloud_std_pub.publish(msg);        // 发布封装后的消息
 
+        // 7.5 根据配置发布全局地图
         if (publish_map)
             Util::publishCloud(global_map_pub, *globalMap, ros::Time(t), current_ref_frame);
 
-        tt_ufoupdate.Toc();    
-    }
+        tt_ufoupdate.Toc(); // 结束UFO地图更新计时    
+    } // AdmitKeyframe() 函数结束
 
     void SendCloudToMapQueue(CloudXYZIPtr &cloud)
     {
@@ -3558,58 +3837,79 @@ public:
         }
     }
 
+    /**
+     * 点云与地图关联函数
+     * 功能描述：将去畸变点云与地图进行关联，计算几何约束系数用于优化
+     * @param Map UFO surfel地图引用，用于基于surfel的关联
+     * @param activeikdtMap ikd-tree地图指针，用于基于k近邻的关联
+     * @param tf_W_B 从传感器坐标系到世界坐标系的变换
+     * @param CloudSkewed 原始带时间戳的畸变点云
+     * @param CloudDeskewedDS 去畸变并下采样的点云
+     * @param CloudCoef 输出的激光雷达约束系数向量
+     * @param stat 关联统计信息映射（尺度->数量）
+     * 主要步骤：
+     *   1. 初始化系数缓冲区和关联器
+     *   2. 并行处理每个点的坐标变换和有效性检查
+     *   3. 根据地图类型执行不同的关联策略
+     *   4. 统计关联结果
+     */
     void AssociateCloudWithMap(ufoSurfelMap &Map, ikdtreePtr &activeikdtMap, mytf tf_W_B,
                                CloudXYZITPtr const &CloudSkewed, CloudXYZIPtr &CloudDeskewedDS,
                                vector<LidarCoef> &CloudCoef, map<int, int> &stat)
     {
+        // ========== 步骤1: 初始化系数缓冲区 ==========
         int pointsCount = CloudDeskewedDS->points.size();
         if (CloudCoef.size() != pointsCount)
         {
-            // Initialize the coefficent buffer
+            // 初始化约束系数缓冲区，预分配内存以提高性能
             CloudCoef.reserve(pointsCount);
         }
 
-        // Create a static associator
+        // 创建静态点到地图关联器（避免重复创建开销）
         static PointToMapAssoc pma(nh_ptr);
 
+        // ========== 步骤2: 并行处理每个特征点 ==========
         int featureTotal = CloudDeskewedDS->size();
-        #pragma omp parallel for num_threads(MAX_THREADS)
+        #pragma omp parallel for num_threads(MAX_THREADS)  // 使用OpenMP并行加速
         for(int k = 0; k < featureTotal; k++)
         {
-            auto &point = CloudDeskewedDS->points[k];
-            int  point_idx = (int)(point.intensity);
-            int  coeff_idx = k;
+            auto &point = CloudDeskewedDS->points[k];  // 当前处理的去畸变点
+            int  point_idx = (int)(point.intensity);   // 原始点云中的索引（存储在强度字段中）
+            int  coeff_idx = k;                        // 系数数组中的索引
 
-            // Reset the coefficient
-            CloudCoef[coeff_idx].t = -1;
-            CloudCoef[coeff_idx].t_ = CloudSkewed->points[point_idx].t;
-            CloudCoef[coeff_idx].d2P = -1;
-            CloudCoef[coeff_idx].ptIdx = point_idx;
-            CloudCoef[coeff_idx].marginalized = false;
+            // ========== 2.1: 重置并初始化约束系数 ==========
+            CloudCoef[coeff_idx].t = -1;                                    // 时间戳（-1表示未关联）
+            CloudCoef[coeff_idx].t_ = CloudSkewed->points[point_idx].t;     // 原始时间戳
+            CloudCoef[coeff_idx].d2P = -1;                                  // 点到平面距离（-1表示未计算）
+            CloudCoef[coeff_idx].ptIdx = point_idx;                         // 原始点索引
+            CloudCoef[coeff_idx].marginalized = false;                      // 边际化标志
 
-            // Set the default value
-            PointXYZIT pointRaw = CloudSkewed->points[point_idx];
-            PointXYZI  pointInB = point;
-            PointXYZI  pointInW = Util::transform_point(tf_W_B, pointInB);
+            // ========== 2.2: 设置点的坐标表示 ==========
+            PointXYZIT pointRaw = CloudSkewed->points[point_idx];          // 原始带时间戳的点
+            PointXYZI  pointInB = point;                                   // 传感器坐标系（Body）中的点
+            PointXYZI  pointInW = Util::transform_point(tf_W_B, pointInB); // 世界坐标系（World）中的点
 
-            // Check if the point is valid
+            // ========== 2.3: 点有效性检查 ==========
             if(!Util::PointIsValid(pointInB) || pointRaw.t < 0)
             {
+                // 如果点无效（NaN、Inf或时间戳无效），跳过处理
                 // printf(KRED "Invalid surf point!: %f, %f, %f\n" RESET, pointInB.x, pointInB.y, pointInB.z);
                 pointInB.x = 0; pointInB.y = 0; pointInB.z = 0; pointInB.intensity = 0;
                 continue;
             }
 
-            // // Check if containing node can marginalize the points
+            // ========== 2.4: 边际化检查（已注释的代码段） ==========
+            // 以下代码用于检查包含节点是否可以边际化点，目前已被注释掉
+            // // 创建包含谓词：检查深度和包含关系
             // auto containPred = ufopred::DepthE(surfel_min_depth)
             //                 && ufopred::Contains(ufoPoint3(pointInW.x, pointInW.y, pointInW.z));
 
-            // // Find the list of containing node
+            // // 查找包含该点的节点列表
             // deque<ufoNode> containingNode;
             // for (const ufoNode &node : Map.queryBV(containPred))
             //     containingNode.push_back(node);
 
-            // // If point has no containing node, consider it a marginalizable points
+            // // 如果点没有包含节点，将其视为可边际化点
             // if (containingNode.size() == 0)
             // {
             //     CloudCoef[coeff_idx + surfel_min_depth].marginalized = true;
@@ -3617,6 +3917,7 @@ public:
             // }
             // else
             // {
+            //     // 遍历包含节点，检查surfel点数是否满足边际化条件
             //     for (const ufoNode &node : containingNode)
             //     {
             //         if (Map.getSurfel(containingNode.front()).getNumPoints() < surfel_min_point)
@@ -3628,71 +3929,85 @@ public:
             //     }
             // }
 
+            // ========== 2.5: 根据地图类型执行不同的关联策略 ==========
             if(use_ufm)
             {
-                Vector3d finB(pointInB.x, pointInB.y, pointInB.z);
-                Vector3d finW(pointInW.x, pointInW.y, pointInW.z);
+                // 策略A: 使用UFO surfel地图进行关联
+                Vector3d finB(pointInB.x, pointInB.y, pointInB.z);  // 传感器坐标系中的点
+                Vector3d finW(pointInW.x, pointInW.y, pointInW.z);  // 世界坐标系中的点
+                // 调用专用关联器进行基于surfel的点-地图关联
                 pma.AssociatePointWithMap(pointRaw, finB, finW, Map, CloudCoef[coeff_idx]);
             }
             else
             {
-                int numNbr = surfel_min_point;
-                ikdtPointVec nbrPoints;
-                vector<float> knnSqDis;
+                // 策略B: 使用ikd-tree地图进行基于k近邻的关联
+                int numNbr = surfel_min_point;     // 需要查找的近邻点数量
+                ikdtPointVec nbrPoints;            // 存储近邻点
+                vector<float> knnSqDis;            // 存储到近邻点的平方距离
+                
+                // 在ikd-tree中进行k近邻搜索
                 activeikdtMap->Nearest_Search(pointInW, numNbr, nbrPoints, knnSqDis);
 
+                // ========== 2.5.1: 近邻点数量和距离检查 ==========
                 if (nbrPoints.size() < numNbr)
-                    continue;
+                    continue;  // 近邻点不足，跳过该点
                 else if (knnSqDis[numNbr - 1] > 5.0)
-                    continue;
+                    continue;  // 最远近邻点距离过大，跳过该点
                 else
                 {
-                    Vector4d pabcd;
-                    double rho;
+                    // ========== 2.5.2: 平面拟合和约束生成 ==========
+                    Vector4d pabcd;  // 平面方程系数 [a,b,c,d]: ax+by+cz+d=0
+                    double rho;      // 平面拟合的可靠性评分
+                    
+                    // 对近邻点进行平面拟合
                     if(Util::fitPlane(nbrPoints, surfel_min_plnrty, dis_to_surfel_max, pabcd, rho))
                     {
+                        // 计算点到平面的距离
                         float d2p = pabcd(0) * pointInW.x + pabcd(1) * pointInW.y + pabcd(2) * pointInW.z + pabcd(3);
+                        
+                        // 计算综合评分：考虑距离和可靠性
                         float score = (1 - 0.9 * fabs(d2p) / Util::pointDistance(pointInB))*rho;
-                        // float score = 1 - 0.9 * fabs(d2p) / (1 + pow(Util::pointDistance(pointInB), 4));
-                        // float score = 1;
+                        // float score = 1 - 0.9 * fabs(d2p) / (1 + pow(Util::pointDistance(pointInB), 4)); // 备选评分方法
+                        // float score = 1; // 简单评分方法
 
+                        // ========== 2.5.3: 根据评分决定是否添加约束 ==========
                         if (score > score_min)
                         {
-                            // Add to coeff
-
+                            // 评分满足要求，添加到约束系数中
                             LidarCoef &coef = CloudCoef[coeff_idx];
 
-                            coef.t      = pointRaw.t;
-                            coef.ptIdx  = point_idx;
-                            coef.n      = pabcd;
-                            coef.scale  = surfel_min_depth;
-                            coef.surfNp = numNbr;
-                            coef.plnrty = score;
-                            coef.d2P    = d2p;
-                            coef.f      = Vector3d(pointRaw.x, pointRaw.y, pointRaw.z);
-                            coef.fdsk   = Vector3d(pointInB.x, pointInB.y, pointInB.z);
-                            coef.finW   = Vector3d(pointInW.x, pointInW.y, pointInW.z);
+                            coef.t      = pointRaw.t;                                        // 时间戳
+                            coef.ptIdx  = point_idx;                                         // 点索引
+                            coef.n      = pabcd;                                             // 平面法向量和距离
+                            coef.scale  = surfel_min_depth;                                  // 尺度层级
+                            coef.surfNp = numNbr;                                            // 近邻点数量
+                            coef.plnrty = score;                                             // 平面度评分
+                            coef.d2P    = d2p;                                               // 点到平面距离
+                            coef.f      = Vector3d(pointRaw.x, pointRaw.y, pointRaw.z);     // 原始点坐标
+                            coef.fdsk   = Vector3d(pointInB.x, pointInB.y, pointInB.z);     // 去畸变点坐标
+                            coef.finW   = Vector3d(pointInW.x, pointInW.y, pointInW.z);     // 世界坐标系点坐标
                         }
                     }
                 }
             }
-        }
+        } // 并行循环结束
 
-        // Find the statistics of the associations
+        // ========== 步骤3: 统计关联结果 ==========
+        // 遍历所有处理过的特征点，统计成功关联的数量
         for(int i = 0; i < featureTotal; i++)
         {
-            int point_idx = (int)CloudDeskewedDS->points[i].intensity;
-            int coeff_idx = i;
+            int point_idx = (int)CloudDeskewedDS->points[i].intensity;  // 获取原始点索引
+            int coeff_idx = i;                                          // 系数索引
 
-            auto &coef = CloudCoef[coeff_idx];
-            if (coef.t >= 0)
+            auto &coef = CloudCoef[coeff_idx];  // 获取对应的约束系数
+            if (coef.t >= 0)  // 如果时间戳有效（>=0），表示该点成功与地图关联
             {
-                // CloudCoef.push_back(coef);
-                stat[coef.scale] += 1;
-                // break;
+                // CloudCoef.push_back(coef);  // 备用代码：将系数添加到列表（已注释）
+                stat[coef.scale] += 1;       // 在统计映射中增加对应尺度的计数
+                // break;                    // 备用代码：跳出循环（已注释）
             }
         }
-    }
+    } // AssociateCloudWithMap() 函数结束
     
     void makeDVAReport(deque<map<int, int>> &stats, map<int, int> &DVA, int &total, string &DVAReport)
     {
@@ -3741,118 +4056,144 @@ public:
         DVAReport += myprintf(". DM: %2d. MaxA: %d", max_depth, max_assoc);
     }
     
+    /**
+     * 因子选择函数
+     * 功能描述：从滑动窗口中选择用于优化的IMU因子和激光雷达因子，控制优化问题规模
+     * @param traj B样条轨迹对象，用于时间有效性检查和索引计算
+     * @param imuSelected 输出的选中IMU因子索引向量
+     * @param featureSelected 输出的选中激光雷达特征因子索引向量
+     * 主要步骤：
+     *   1. 选择所有有效的IMU因子
+     *   2. 选择激光雷达因子（应用下采样）
+     *   3. 如果激光雷达因子过多，进行随机下采样
+     * 设计目的：平衡优化精度与计算效率，避免因子数量过多导致的性能问题
+     */
     void FactorSelection(PoseSplineX &traj, vector<ImuIdx> &imuSelected, vector<lidarFeaIdx> &featureSelected)
     {
-        // Counters for coupling on each knot
-        // vector<int> knot_count_imu(traj.numKnots(), 0);
-        // vector<int> knot_count_ldr(traj.numKnots(), 0);
+        // 每个节点上的耦合计数器（已注释，用于调试和分析）
+        // vector<int> knot_count_imu(traj.numKnots(), 0);  // IMU因子在各节点的分布计数
+        // vector<int> knot_count_ldr(traj.numKnots(), 0);  // 激光雷达因子在各节点的分布计数
 
-        // Selecting the imu factors
-        for(int i = 0; i < WINDOW_SIZE; i++)
+        // ========== 步骤1: 选择IMU因子 ==========
+        // 遍历滑动窗口中的所有IMU数据，选择有效的IMU因子
+        for(int i = 0; i < WINDOW_SIZE; i++)        // 遍历滑动窗口中的每一帧
         {
-            for(int j = 0; j < N_SUB_SEG; j++)
+            for(int j = 0; j < N_SUB_SEG; j++)      // 遍历每帧的所有时间子段
             {
-                for(int k = 1; k < SwImuBundle[i][j].size(); k++)
+                for(int k = 1; k < SwImuBundle[i][j].size(); k++)  // 遍历每个子段中的IMU样本（跳过第0个）
                 {
-                    double sample_time = SwImuBundle[i][j][k].t;
+                    double sample_time = SwImuBundle[i][j][k].t;  // 获取IMU样本的时间戳
                     
-                    // Skip if sample time exceeds the bound
+                    // 检查样本时间是否超出轨迹有效范围
                     if (!traj.TimeIsValid(sample_time, 1e-6))
-                        continue;
+                        continue;  // 时间无效，跳过该样本
 
-                    auto us = traj.computeTIndex(sample_time);
-                    int knot_idx = us.second;
+                    auto us = traj.computeTIndex(sample_time);  // 计算时间索引
+                    int knot_idx = us.second;                   // 获取对应的节点索引
 
-                    // knot_count_imu[knot_idx] += 1;
-                    imuSelected.push_back(ImuIdx(i, j, k));
+                    // knot_count_imu[knot_idx] += 1;  // 节点计数（已注释）
+                    imuSelected.push_back(ImuIdx(i, j, k));     // 添加到选中的IMU因子列表
                 }
             }
         }
 
-        // A temporary container of selected features by steps in the sliding window for further downsampling
+        // ========== 步骤2: 选择激光雷达因子 ==========
+        // 按滑动窗口步骤分组的特征临时容器，用于进一步下采样
         vector<vector<lidarFeaIdx>> featureBySwStep(WINDOW_SIZE);
 
-        // Selecting the lidar factor
-        int total_selected = 0;
-        for (int i = 0; i < WINDOW_SIZE; i++)
+        // 选择激光雷达因子
+        int total_selected = 0;  // 总选中因子计数
+        for (int i = 0; i < WINDOW_SIZE; i++)  // 遍历滑动窗口中的每一帧
         {
-            for (int k = 0; k < SwCloudDskDS[i]->size(); k++)
+            for (int k = 0; k < SwCloudDskDS[i]->size(); k++)  // 遍历当前帧中的每个点
             {
-                // A lot of factors are calculated but only a subset are used for optimization (time constraint).
-                // By adding a counter we can shuffle the factors so all factors have the chance to be used.
+                // 应用下采样策略：计算了很多因子，但由于时间限制只使用其中一部分进行优化
+                // 通过添加计数器来打乱因子顺序，让所有因子都有被使用的机会
                 if ((k + i) % lidar_ds_rate != 0)
-                    continue;
+                    continue;  // 跳过不满足下采样条件的点
 
-                auto &point = SwCloudDskDS[i]->points[k];
-                int  point_idx = (int)(point.intensity);
-                int  coeff_idx = k;
+                auto &point = SwCloudDskDS[i]->points[k];        // 当前处理的点
+                int  point_idx = (int)(point.intensity);         // 原始点云中的索引
+                int  coeff_idx = k;                              // 系数数组中的索引
 
-                LidarCoef &coef = SwLidarCoef[i][coeff_idx];
+                LidarCoef &coef = SwLidarCoef[i][coeff_idx];     // 获取对应的激光雷达约束系数
 
+                // 检查约束系数是否有效（t<0表示该点未成功关联到地图）
                 if (coef.t < 0)
                     continue;
 
-                double sample_time = coef.t;
+                double sample_time = coef.t;  // 获取样本时间戳
 
+                // 检查样本时间是否在轨迹有效范围内
                 if (!traj.TimeIsValid(sample_time, 1e-6))
                     continue;
 
-                auto us = traj.computeTIndex(sample_time);
-                int knot_idx = us.second;
+                auto us = traj.computeTIndex(sample_time);  // 计算时间索引
+                int knot_idx = us.second;                   // 获取对应的节点索引
 
-                total_selected++;
-                // knot_count_ldr[knot_idx] += 1;
+                total_selected++;  // 增加总选中计数
+                // knot_count_ldr[knot_idx] += 1;  // 节点计数（已注释）
+                
+                // 将特征索引添加到对应滑动窗口步骤的容器中
                 featureBySwStep[i].push_back(lidarFeaIdx(i, k, coef.scale, total_selected));
             }
         }
 
-        // If number of lidar feature remain large, randomly select a subset
+        // ========== 步骤3: 激光雷达因子数量控制 ==========
+        // 如果激光雷达特征数量仍然很大，随机选择一个子集
         if (total_selected > max_lidar_factor)
         {
-            // Define Fisher-Yates shuffle lambda function
+            // ========== 3.1: 定义Fisher-Yates随机打乱算法 ==========
+            // 使用Lambda函数实现经典的Fisher-Yates洗牌算法，确保均匀随机分布
             auto fisherYatesShuffle = [](std::vector<int>& array)
             {
-                std::random_device rd;
-                std::mt19937 gen(rd());
+                std::random_device rd;    // 硬件随机数生成器
+                std::mt19937 gen(rd());   // 梅森旋转伪随机数生成器
 
+                // 从数组末尾开始，逐个与前面的随机位置交换
                 for (int i = array.size() - 1; i > 0; --i)
                 {
-                    std::uniform_int_distribution<int> distribution(0, i);
-                    int j = distribution(gen);
-                    std::swap(array[i], array[j]);
+                    std::uniform_int_distribution<int> distribution(0, i);  // 均匀分布[0,i]
+                    int j = distribution(gen);  // 生成随机索引
+                    std::swap(array[i], array[j]);  // 交换元素
                 }
             };
 
-            // How many features each swstep do we need?
+            // ========== 3.2: 计算每个滑动窗口步骤需要的特征数量 ==========
             int maxFeaPerSwStep = ceil(double(max_lidar_factor) / WINDOW_SIZE);
 
-            // Container for shuffled features
-            // vector<vector<lidarFeaIdx>> featureBySwStepShuffled(WINDOW_SIZE);
-            vector<vector<int>> shuffledIdx(WINDOW_SIZE);
+            // ========== 3.3: 创建打乱索引容器 ==========
+            // vector<vector<lidarFeaIdx>> featureBySwStepShuffled(WINDOW_SIZE);  // 备用容器（已注释）
+            vector<vector<int>> shuffledIdx(WINDOW_SIZE);  // 存储打乱后的索引
 
-            #pragma omp parallel for num_threads(MAX_THREADS)
+            // ========== 3.4: 并行生成打乱索引 ==========
+            #pragma omp parallel for num_threads(MAX_THREADS)  // 使用OpenMP并行处理
             for(int wid = 0; wid < WINDOW_SIZE; wid++)
             {
+                // 为当前窗口步骤创建索引数组
                 shuffledIdx[wid] = vector<int>(featureBySwStep[wid].size());
-                std::iota(shuffledIdx[wid].begin(), shuffledIdx[wid].end(), 0);
+                std::iota(shuffledIdx[wid].begin(), shuffledIdx[wid].end(), 0);  // 初始化为0,1,2,3,...
                 
-                // Shuffle the feature set a few times
+                // 多次打乱以增强随机性（提高随机分布质量）
                 fisherYatesShuffle(shuffledIdx[wid]);
                 fisherYatesShuffle(shuffledIdx[wid]);
                 fisherYatesShuffle(shuffledIdx[wid]);
             }
 
+            // ========== 3.5: 根据打乱后的索引选择特征 ==========
             for(int wid = 0; wid < WINDOW_SIZE; wid++)
                 for(int idx = 0; idx < min(maxFeaPerSwStep, (int)featureBySwStep[wid].size()); idx++)
                         featureSelected.push_back(featureBySwStep[wid][shuffledIdx[wid][idx]]);
         }
         else
         {
+            // ========== 步骤4: 直接添加所有特征 ==========
+            // 如果特征数量在限制范围内，直接添加所有选中的特征
             for(int wid = 0; wid < WINDOW_SIZE; wid++)
                 for(int idx = 0; idx < featureBySwStep[wid].size(); idx++)
                     featureSelected.push_back(featureBySwStep[wid][idx]);
         }
-    }
+    } // FactorSelection() 函数结束
 
     void DetectLoop()
     {
